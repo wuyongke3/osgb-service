@@ -81,37 +81,113 @@ type Config struct {
 	LODLevels int
 }
 
+// Memory model for the automatically derived worker count.
+//
+// COLMAP's SIFT extraction is the memory peak of the whole pipeline: each worker
+// holds a full-size image, its pyramid and its keypoints. The figures below were
+// measured in the deployment image at a 12 GB container limit with 3200px images:
+//
+//	threads=1   peak 2.37 GB
+//	threads=2   peak 4.55 GB
+//	threads=3   peak 6.74 GB
+//	threads=4   peak 8.90 GB
+//	threads=6   peak 12 GB  (saturated the limit)
+//	threads=8   peak 12 GB  killed (exit 137)
+//
+// The slope is about 2.2 GB per worker at this image size, far above an earlier
+// 350 MB estimate that let the automatic setting choose a parallelism that was
+// OOM-killed on real survey imagery.
+const (
+	// bytesPerMegapixelPerWorker is SIFT peak memory per worker per megapixel of
+	// the image it is processing.
+	//
+	// Calibrated: 3200x2400 is 7.68 MP and cost ~2.2 GB per worker, i.e. about
+	// 290 MB per megapixel. Rounded up to 320 for cameras that are not 4:3 and to
+	// stay safely below the measured kill point.
+	bytesPerMegapixelPerWorker = 320 << 20 // 320 MB per megapixel
+	// siftBaseBytes is the fixed cost of the process plus one resident image
+	// buffer before any worker parallelism is added, from the 1-thread run above
+	// minus one worker's share.
+	siftBaseBytes = 256 << 20 // 256 MB
+	// reservedBytes stays free for the Go service, the log and SSE goroutines,
+	// page cache and whatever else the host runs.
+	reservedBytes = 1 << 30 // 1 GB
+	// fallbackMegapixels is used when MaxImageSize is disabled (0), so the
+	// calculation still has a defensible figure rather than assuming zero.
+	fallbackMegapixels = 8.0
+)
+
+// estimateWorkerBytes returns the peak memory assumed for one SIFT worker.
+func (c Config) estimateWorkerBytes() int64 {
+	megapixels := fallbackMegapixels
+	if c.MaxImageSize > 0 {
+		// The cap applies to the long edge; assume a 4:3 frame, which is what
+		// survey cameras overwhelmingly produce.
+		longEdge := float64(c.MaxImageSize)
+		megapixels = (longEdge * longEdge * 3 / 4) / 1_000_000
+	}
+	if megapixels < 0.1 {
+		megapixels = 0.1
+	}
+	return int64(megapixels*float64(bytesPerMegapixelPerWorker)) + siftBaseBytes
+}
+
 // resolveThreads returns the worker count to pass to subprocesses.
 //
 // The service runs CPU-only by design, so thread count is the main performance
-// lever. It previously passed a hard-coded 4, which left most of a modern
-// server idle: on a 32-core host that used 12% of the available compute.
+// lever. It previously passed a hard-coded 4, which left most of a modern server
+// idle. An intermediate version counted CPUs alone; on a 32-core host with a
+// 12 GB container limit that chose 16 workers and COLMAP was OOM-killed during
+// feature extraction (cgroup reported oom_kill). Memory, not core count, is what
+// bounds this pipeline.
 //
-// An explicit Threads setting always wins. Otherwise the count is derived as
-// GOMAXPROCS minus one, leaving a core for the Go HTTP server, log scanning and
-// the streaming goroutines that read subprocess output. The result is clamped to
-// [1, maxAutoThreads] so a container limit of 128 CPUs does not spawn a
-// pathological number of workers.
+// An explicit Threads setting always wins. Otherwise the count is the smallest
+// of:
+//   - GOMAXPROCS minus one, leaving a core for the HTTP server and log readers
+//   - what the memory budget allows, after reserving room for everything else
+//   - maxAutoThreads
+//
+// The result is at least 1, so the pipeline still runs on a small machine.
 func (c Config) resolveThreads() int {
 	if c.Threads > 0 {
 		return c.Threads
 	}
-	available := runtime.GOMAXPROCS(0)
-	if available > 1 {
-		available--
+
+	byCPU := runtime.GOMAXPROCS(0)
+	if byCPU > 1 {
+		byCPU--
 	}
-	if available < 1 {
-		available = 1
+
+	byMemory := maxAutoThreads
+	if limit, ok := availableMemoryBytes(); ok {
+		budget := int64(limit) - reservedBytes
+		// estimateWorkerBytes already includes the fixed base cost, so the
+		// memory needed for n workers is n * perWorker. Divide directly; the
+		// base is therefore only counted once, matching the linear fit.
+		perWorker := c.estimateWorkerBytes()
+		if budget < perWorker {
+			// Not enough headroom for even one full-size worker. Fall back to a
+			// single worker and let the operator lower SIFT_MAX_IMAGE_SIZE.
+			byMemory = 1
+		} else {
+			byMemory = int(budget / perWorker)
+		}
 	}
-	if available > maxAutoThreads {
-		available = maxAutoThreads
+
+	threads := byCPU
+	if byMemory < threads {
+		threads = byMemory
 	}
-	return available
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > maxAutoThreads {
+		threads = maxAutoThreads
+	}
+	return threads
 }
 
-// maxAutoThreads caps the automatically derived worker count. COLMAP and OpenMVS
-// both allocate per-thread buffers, and the container runs under a memory limit,
-// so unbounded parallelism trades speed for out-of-memory kills.
+// maxAutoThreads caps the automatically derived worker count.
 const maxAutoThreads = 16
 
 func loadConfig() Config {

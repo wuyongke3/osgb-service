@@ -285,11 +285,22 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
 
 ### 线程数
 
-`PIPELINE_THREADS=0`（默认）表示自动：取“可用 CPU 核数 − 1”，上限 16，留一核给服务自身的 HTTP、日志与流式输出。设置成具体数值即可覆盖。上限存在的原因是 COLMAP 与 OpenMVS 会按线程分配缓冲，容器有内存上限，线程数过高会以 OOM 换取速度。
+`PIPELINE_THREADS=0`（默认）表示自动，由**内存和 CPU 共同**决定，取两者更小的一个：
+
+- **CPU 上限**：可用核数 − 1（留一核给服务自身），上限 16
+- **内存上限**：按容器内存限制与 `SIFT_MAX_IMAGE_SIZE` 推算单 worker 峰值，再反推能容纳几个 worker
+
+内存是真正的约束。实测（12 GB 容器、3200px 影像）：2 线程峰值 4.5 GB、4 线程 8.9 GB，而 8 线程直接被 OOM 杀掉（`exit 137`）。因此自动推导会把 12 GB 容器里的特征提取限制在 4 个线程。
+
+设置成具体数值即可覆盖（例如 `PIPELINE_THREADS=8`），但请确保容器内存足够，否则会重现 OOM。若机器内存充裕、想压榨性能，可同时调大 `OSGB_MEMORY_LIMIT`。
 
 ### 何时调低参数
 
-若容器因内存不足被终止（日志出现 `signal: killed`），优先降低 `PIPELINE_THREADS`，其次降低 `SIFT_MAX_IMAGE_SIZE`。
+若容器因内存不足被终止（日志出现 `signal: killed`，`docker inspect` 显示 `OOMKilled=true`），按以下顺序处理：
+
+1. 降低 `PIPELINE_THREADS`（例如从自动改显式为 2）
+2. 降低 `SIFT_MAX_IMAGE_SIZE`（例如 3200 → 2000）
+3. 提高 `OSGB_MEMORY_LIMIT`（前提是宿主机有足够空闲内存）
 
 ---
 

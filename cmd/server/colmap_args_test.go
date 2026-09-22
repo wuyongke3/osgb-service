@@ -85,7 +85,8 @@ func TestResolveThreadsExplicitWins(t *testing.T) {
 
 // TestResolveThreadsAutoUsesAvailableCPUs is the regression test for the
 // hard-coded `num_threads 4`: the resolved count must scale with the host rather
-// than being fixed at 4.
+// than being fixed at 4. It must also never exceed the CPU count even when the
+// memory limit is generous, because the CPU bound is still applied.
 func TestResolveThreadsAutoUsesAvailableCPUs(t *testing.T) {
 	config := Config{Threads: 0}
 	got := config.resolveThreads()
@@ -97,16 +98,18 @@ func TestResolveThreadsAutoUsesAvailableCPUs(t *testing.T) {
 		t.Fatalf("resolveThreads() = %d, want at most %d", got, maxAutoThreads)
 	}
 
+	// The CPU bound is an upper limit: the count may be lower because of memory,
+	// but never higher than one worker per remaining core.
 	available := runtime.GOMAXPROCS(0)
-	want := available - 1
-	if want < 1 {
-		want = 1
+	cpuBound := available - 1
+	if cpuBound < 1 {
+		cpuBound = 1
 	}
-	if want > maxAutoThreads {
-		want = maxAutoThreads
+	if cpuBound > maxAutoThreads {
+		cpuBound = maxAutoThreads
 	}
-	if got != want {
-		t.Fatalf("resolveThreads() = %d, want %d (GOMAXPROCS=%d)", got, want, available)
+	if got > cpuBound {
+		t.Fatalf("resolveThreads() = %d exceeds the CPU bound %d (GOMAXPROCS=%d)", got, cpuBound, available)
 	}
 }
 
