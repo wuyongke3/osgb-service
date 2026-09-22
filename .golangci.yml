@@ -1,0 +1,131 @@
+# golangci-lint configuration for osgb-service.
+#
+# The project deliberately has zero third-party Go dependencies (go.mod contains
+# only the module line), so the enabled linters are the ones that catch real
+# defects in standard-library code: unchecked errors, shadowed variables, unused
+# code, and mistakes that go vet does not reach.
+#
+# Run locally with:  golangci-lint run ./...
+# Both this file and gofmt must pass before committing.
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    # Correctness: these find bugs rather than style.
+    - errcheck      # ignored error returns; the pipeline is full of I/O
+    - govet         # the standard analysers
+    - ineffassign   # assignments never used
+    - staticcheck   # broad static analysis
+    - unused        # dead code
+    - bodyclose     # HTTP response bodies left open
+    - rowserrcheck  # sql.Rows.Err not checked
+    - nilerr        # returning nil after a non-nil error
+    - errorlint     # error comparison that breaks on wrapping
+    - contextcheck  # context not propagated
+    - noctx         # HTTP requests without a context
+    - unconvert     # needless type conversions
+    - wastedassign  # assignments that are immediately overwritten
+    # Style that catches genuine mistakes.
+    - misspell
+    - gocritic
+    - revive
+
+linters-settings:
+  errcheck:
+    # Writes to an HTTP response and deferred closes cannot be acted on, and
+    # checking them would add noise without changing behaviour.
+    exclude-functions:
+      - (io.Closer).Close
+      - (*os.File).Close
+      - fmt.Fprint
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - (net/http.ResponseWriter).Write
+  govet:
+    enable-all: true
+    disable:
+      # fieldalignment reports struct layout savings that are irrelevant here;
+      # the structs are small and mostly short-lived.
+      - fieldalignment
+      # shadow flags the idiomatic `if err := f(); err != nil` form whenever an
+      # outer err is in scope. Every reported case was reviewed: the outer error
+      # is always handled before the inner declaration, so no value is lost. The
+      # check is noisy enough on ordinary Go that keeping it would train readers
+      # to ignore vet output.
+      - shadow
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+    disabled-checks:
+      # The codebase uses explicit if/else for clarity in several hot paths.
+      - ifElseChain
+      - singleCaseSwitch
+      - hugeParam
+      # Comment style is intentional and consistent.
+      - commentFormatting
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+        disabled: true   # many exported names mirror JSON field names
+      - name: if-return
+      - name: increment-decrement
+      - name: var-naming
+      - name: var-declaration
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: unused-parameter
+      - name: unreachable-code
+      - name: redefines-builtin-id
+  misspell:
+    locale: US
+
+issues:
+  # Report every occurrence rather than truncating identical messages, so a
+  # single run gives the complete picture.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Tests may ignore errors on setup helpers and use long literal tables.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+        - revive
+    # contextcheck flags jobs because they deliberately run on a context rooted
+    # at Background instead of the HTTP request context. That is intentional: a
+    # reconstruction runs for hours and must survive the browser disconnecting.
+    # Cancellation is handled explicitly through the per-command timeout and the
+    # cancel registry in JobManager. See the comment on runCommand.
+    - path: cmd/server/main\.go
+      linters:
+        - contextcheck
+      source: "go m\\.run|m\\.startPlan|m\\.resumeFromDense|m\\.resumeJob"
+    # namedResult and parameter-grouping suggestions are stylistic and would
+    # churn well-tested function signatures for no behavioural gain.
+    - linters:
+        - gocritic
+      text: "unnamedResult|paramTypeCombine|nestingReduce"
+    # validateSmart3DTree deliberately continues after a per-tile validation
+    # error: one unreadable tile must not abort the walk. The tile is recorded as
+    # failed before returning nil, so the failure is still counted.
+    - path: cmd/server/pagedlod_tree\.go
+      linters:
+        - nilerr
+      text: "error is not nil"

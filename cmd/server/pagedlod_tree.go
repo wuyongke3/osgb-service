@@ -41,7 +41,7 @@ type osgbTileStats struct {
 // tileBoundaryTolerance returns the distance from a tile's bounding box border
 // within which vertices are pinned during simplification. It is derived from the
 // tile's own extent so that the locked band stays proportional when the source
-// model uses any unit (metres, feet, or OpenMVS local coordinates).
+// model uses any unit (meters, feet, or OpenMVS local coordinates).
 //
 // A band that is too wide would lock most vertices and defeat simplification,
 // so it is capped at a small fraction of the tile size. Meshes with a
@@ -220,7 +220,9 @@ func runOSGConvQuiet(osgconv, input, output, workDir string) error {
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("osgconv %s -> %s: %v: %s", input, output, err, strings.TrimSpace(string(out)))
+		// %w keeps the underlying *exec.ExitError reachable via errors.Is/As,
+		// while the captured output is appended for diagnosis.
+		return fmt.Errorf("osgconv %s -> %s: %w: %s", input, output, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -273,6 +275,170 @@ func absInt(v int) int {
 		return -v
 	}
 	return v
+}
+
+// buildTileLODLevels produces a tile's LOD chain, ordered coarsest first.
+//
+// The chain always ends with the full-resolution mesh, so the finest level is
+// never simplified. Each earlier level targets a face count divided by
+// lodFaceRatio relative to the next finer one, which reproduces the original
+// hand-written behavior exactly when levelCount is 3: the result is
+// {1/16, 1/4, full}.
+//
+// A level that simplifies down to nothing would leave a PagedLOD referencing an
+// empty child, so it is dropped rather than emitted, and the chain simply
+// becomes shorter. This is what previously produced the "coarse LOD empty"
+// warnings on small tiles; here the degenerate level is removed silently and
+// only the resulting depth is reported.
+func buildTileLODLevels(mesh *objMesh, tolerance float64, levelCount int) []*objMesh {
+	if levelCount < 1 {
+		levelCount = 1
+	}
+	// Guard against an absurd request: every extra level costs three osgconv
+	// invocations per tile, and beyond a handful the visual gain disappears.
+	if levelCount > maxLODLevels {
+		levelCount = maxLODLevels
+	}
+	total := len(mesh.triangles)
+	if levelCount == 1 || total == 0 {
+		return []*objMesh{mesh}
+	}
+
+	// Walk from coarsest to finest. Level i (0-based, coarsest first) targets
+	// totalFaces / ratio^(levelCount-1-i), so the last level targets the full
+	// face count and is therefore returned unsimplified by the simplify call.
+	levels := make([]*objMesh, 0, levelCount)
+	for i := 0; i < levelCount-1; i++ {
+		divisor := 1
+		for k := 0; k < levelCount-1-i; k++ {
+			divisor *= lodFaceRatio
+		}
+		target := total / divisor
+		if target < 1 {
+			target = 1
+		}
+		level := simplifyMeshPreservingBoundary(mesh, target, tolerance)
+		// A level identical to the previous one adds a file and three osgconv
+		// runs without adding any visual step, so skip it.
+		if len(level.triangles) == 0 {
+			continue
+		}
+		if len(levels) > 0 && len(level.triangles) == len(levels[len(levels)-1].triangles) {
+			continue
+		}
+		levels = append(levels, level)
+	}
+	levels = append(levels, mesh)
+	return levels
+}
+
+// lodSwitchThreshold returns the screen-space pixel size at which PagedLOD
+// level li hands over to the next finer level.
+//
+// The original code used radius * 2^(2-li), which was only correct for a chain
+// of exactly three levels: it made L0 switch at 4*radius and L1 at 2*radius.
+// The general form keeps that behavior while working for any chain length by
+// deriving the shift from the distance to the finest level, so each step down
+// halves the threshold.
+func lodSwitchThreshold(radius float64, levelIndex, levelCount int) float64 {
+	finestIndex := levelCount - 1
+	shift := finestIndex - levelIndex
+	if shift < 0 {
+		shift = 0
+	}
+	// Cap the shift so a long chain cannot overflow or produce a threshold so
+	// large that the coarse level never yields.
+	if shift > maxThresholdShift {
+		shift = maxThresholdShift
+	}
+	return radius * float64(uint(1)<<uint(shift))
+}
+
+const (
+	// lodFaceRatio is the face-count divisor between adjacent LOD levels.
+	// Each step is 4x coarser, matching the original fixed 1/4 and 1/16 levels.
+	lodFaceRatio = 4
+	// maxLODLevels bounds an operator-configured chain length.
+	maxLODLevels = 6
+	// maxThresholdShift bounds the exponent used when deriving switch distances.
+	maxThresholdShift = 20
+
+	// Default tile grid and the bounds applied when sizing adaptively.
+	// The upper bound keeps the osgconv call count (tiles x levels x 3) and the
+	// resulting file count within reason; the lower bound avoids producing a
+	// single enormous tile for a small model.
+	defaultGridSize = 16
+	minGridSize     = 4
+	maxGridSize     = 24
+
+	// targetFacesPerTile is the face count a tile is sized towards when the
+	// grid is chosen adaptively. It is deliberately coarse: the goal is only to
+	// scale the grid with the model instead of assuming every project is the
+	// same size.
+	targetFacesPerTile = 120000
+)
+
+// adaptiveGridSize chooses a tile grid dimension from the model's triangle
+// count.
+//
+// The grid was previously fixed at 16x16 regardless of model size, which meant a
+// small model produced many empty tiles (each logged as a warning) while a very
+// large model still got oversized tiles. The dimension is derived from a target
+// face count per tile and rounded to a power of two, then clamped.
+func adaptiveGridSize(triangleCount int) int {
+	if triangleCount <= 0 {
+		return minGridSize
+	}
+	// Solve tiles = triangleCount / targetFacesPerTile for a per-axis grid.
+	tiles := float64(triangleCount) / float64(targetFacesPerTile)
+	perAxis := int(math.Ceil(math.Sqrt(tiles)))
+	if perAxis < minGridSize {
+		perAxis = minGridSize
+	}
+	if perAxis > maxGridSize {
+		perAxis = maxGridSize
+	}
+	return perAxis
+}
+
+// adaptiveLODLevels chooses a LOD chain depth from the per-tile face count.
+//
+// The chain was previously always three levels. A tile with only a few hundred
+// faces gains nothing from two coarser copies, while a very dense tile benefits
+// from an extra step. Levels are added roughly per factor of 16 in tile size,
+// matching the 4x-per-step ratio.
+func adaptiveLODLevels(facesPerTile int) int {
+	switch {
+	case facesPerTile <= 2000:
+		return 1
+	case facesPerTile <= 20000:
+		return 2
+	case facesPerTile <= 400000:
+		return 3
+	case facesPerTile <= 2000000:
+		return 4
+	default:
+		return 5
+	}
+}
+
+// resolveTreeOptions turns the configured grid/LOD settings into the options
+// used for one build, applying adaptive sizing where the configuration leaves
+// the choice open (zero or negative).
+func resolveTreeOptions(triangleCount int, gridSetting, lodSetting int, logFn func(string)) treeOptions {
+	grid := gridSetting
+	if grid <= 0 {
+		grid = adaptiveGridSize(triangleCount)
+	}
+	perTile := 0
+	if grid > 0 {
+		perTile = triangleCount / (grid * grid)
+	}
+	levels := lodSetting
+	if levels <= 0 {
+		levels = adaptiveLODLevels(perTile)
+	}
+	return treeOptions{GridX: grid, GridY: grid, LODLevels: levels, Log: logFn}
 }
 
 // buildSmart3DOSGB builds the full Smart3D-style PagedLOD tree under outputDir.
@@ -410,7 +576,38 @@ func filterTexMapForMesh(mesh *objMesh, texMap map[string]string) map[string]str
 	}
 	return out
 }
+
+// treeOptions controls how a PagedLOD tree is laid out.
+type treeOptions struct {
+	// GridX and GridY are the tile grid dimensions.
+	GridX, GridY int
+	// LODLevels is the depth of each tile's LOD chain, coarsest first. Three
+	// levels (1/16, 1/4, full) is the historical default.
+	LODLevels int
+	// Log receives progress messages. May be nil.
+	Log func(string)
+}
+
+// defaultLODLevels is the LOD chain depth used when a caller does not specify
+// one. It preserves the original coarse/medium/full arrangement.
+const defaultLODLevels = 3
+
+// buildSmart3DOSGB builds a tree with the historical behavior: the caller's
+// grid dimensions and the default three-level LOD chain.
 func buildSmart3DOSGB(mesh *objMesh, texMap map[string]string, osgconv string, outputDir string, gridX, gridY int, logFn func(string)) error {
+	return buildSmart3DOSGBWithOptions(mesh, texMap, osgconv, outputDir, treeOptions{
+		GridX: gridX, GridY: gridY, LODLevels: defaultLODLevels, Log: logFn,
+	})
+}
+
+// buildSmart3DOSGBWithOptions builds the full Smart3D-style PagedLOD tree.
+func buildSmart3DOSGBWithOptions(mesh *objMesh, texMap map[string]string, osgconv string, outputDir string, opts treeOptions) error {
+	gridX, gridY := opts.GridX, opts.GridY
+	lodLevels := opts.LODLevels
+	if lodLevels < 1 {
+		lodLevels = defaultLODLevels
+	}
+	logFn := opts.Log
 	if gridX <= 0 {
 		gridX = 1
 	}
@@ -466,24 +663,11 @@ func buildSmart3DOSGB(mesh *objMesh, texMap map[string]string, osgconv string, o
 			}
 			subMesh := extractSubMesh(mesh, triIdx)
 			cx, cy, cz, radius := computeTileCenterRadius(subMesh)
-			// Lock the tile's outer border so neighbouring tiles keep sampling
+			// Lock the tile's outer border so neighboring tiles keep sampling
 			// their shared edge at identical positions; without this each tile
 			// simplifies independently and the tree opens cracks.
 			tolerance := tileBoundaryTolerance(subMesh)
-			lod1 := simplifyMeshPreservingBoundary(subMesh, max(1, len(subMesh.triangles)/4), tolerance)
-			lod2 := simplifyMeshPreservingBoundary(subMesh, max(1, len(subMesh.triangles)/16), tolerance)
-			if len(lod2.triangles) == 0 {
-				lod2 = lod1
-				logFn(fmt.Sprintf("tile %s: coarse LOD empty, using L1", name))
-			}
-			if len(lod1.triangles) == 0 {
-				lod1 = subMesh
-				logFn(fmt.Sprintf("tile %s: mid LOD empty, using full mesh", name))
-			}
-			if len(lod2.triangles) == 0 {
-				lod2 = lod1
-			}
-			levels := []*objMesh{lod2, lod1, subMesh}
+			levels := buildTileLODLevels(subMesh, tolerance, lodLevels)
 			entry := tileEntry{name: name, centerX: cx, centerY: cy, centerZ: cz, radius: radius}
 			for li, level := range levels {
 				base := fmt.Sprintf("%s_L%d", name, li)
@@ -510,7 +694,7 @@ func buildSmart3DOSGB(mesh *objMesh, texMap map[string]string, osgconv string, o
 				os.Remove(tmpOSGT)
 
 				childFile := ""
-				threshold := radius * float64(uint(1)<<(2-li))
+				threshold := lodSwitchThreshold(radius, li, len(levels))
 				if li < len(levels)-1 {
 					childFile = fmt.Sprintf("%s_L%d.osgb", name, li+1)
 				}
@@ -692,11 +876,12 @@ func validateOSGBTile(osgconv, osgbPath string, requireMetadata bool) (*osgbTile
 					fields := strings.Fields(seg[vIdx : vIdx+64])
 					if len(fields) >= 2 {
 						if n, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
-							if m == "DrawArrays" {
-								faces += n / 3
-							} else {
-								faces += n / 3
-							}
+							// Both indexed draws and non-indexed draws list one
+							// entry per corner, so both become faces by dividing
+							// by three. The two cases were previously written as
+							// separate identical branches, which suggested a
+							// distinction that does not exist.
+							faces += n / 3
 						}
 					}
 					pos += vIdx
@@ -771,7 +956,18 @@ func validateSmart3DTree(osgconv, outputDir string, logFn func(string)) ([]*osgb
 		}
 		stats, tileErr := validateOSGBTile(osgconv, path, true)
 		if tileErr != nil {
+			// A tile that cannot even be inspected must still be counted as a
+			// failure. Previously it was logged and then dropped from the
+			// report entirely, so validateSmart3DTree could return no failed
+			// tiles while tiles were in fact unreadable, and the partial
+			// delivery threshold in runSmart3DPagedLOD would not see them.
 			logFn("VALIDATE ERROR " + path + ": " + tileErr.Error())
+			allStats = append(allStats, &osgbTileStats{
+				Name:  strings.TrimSuffix(filepath.Base(path), ".osgb"),
+				Path:  path,
+				Valid: false,
+				Error: "not inspectable: " + tileErr.Error(),
+			})
 			return nil
 		}
 		if stats.Valid {

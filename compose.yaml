@@ -28,6 +28,11 @@ services:
       # Lower it if the container is killed for exceeding mem_limit.
       PIPELINE_THREADS: "0"
       SIFT_MAX_IMAGE_SIZE: "3200"
+      # PagedLOD tree layout. 0 = size from the model: the tile grid from the
+      # triangle count, the LOD depth from the per-tile face count. Set
+      # TILE_GRID=16 and LOD_LEVELS=3 to reproduce the old fixed layout.
+      TILE_GRID: "0"
+      LOD_LEVELS: "0"
       MAX_UPLOAD_GB: "50"
       PIPELINE_MODE: native
       COMMAND_TIMEOUT_HOURS: "24"

@@ -6,7 +6,7 @@ package main
 // The option-name selection exists because COLMAP renamed its SIFT option
 // groups: 3.x uses --SiftExtraction.* / --SiftMatching.*, 4.x uses
 // --FeatureExtraction.* / --FeatureMatching.*. Passing the wrong spelling is a
-// hard error ("unrecognised option") rather than a warning, so a wrong guess
+// hard error ("unrecognized option") rather than a warning, so a wrong guess
 // fails an entire job. The deployment image ships 3.9.1 while a developer
 // machine may have 4.x, which is why detection happens per binary.
 
@@ -73,7 +73,7 @@ func hasFlagValue(args []string, flag, value string) bool {
 // Thread resolution
 // ---------------------------------------------------------------------------
 
-// TestResolveThreadsExplicitWins: an operator setting must always be honoured.
+// TestResolveThreadsExplicitWins: an operator setting must always be honored.
 func TestResolveThreadsExplicitWins(t *testing.T) {
 	for _, threads := range []int{1, 2, 4, 32, 128} {
 		config := Config{Threads: threads}
@@ -198,7 +198,7 @@ func TestMatcherArgsAlwaysPassThreadCount(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestOptionGroupNames pins the two spellings, since getting these wrong makes
-// COLMAP exit immediately with "unrecognised option".
+// COLMAP exit immediately with "unrecognized option".
 func TestOptionGroupNames(t *testing.T) {
 	if got := colmapStyleLegacy.extractionGroup(); got != "SiftExtraction" {
 		t.Errorf("legacy extraction group = %q", got)

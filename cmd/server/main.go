@@ -46,6 +46,12 @@ const (
 	phaseFailed         = "failed"
 )
 
+// errJobcanceled marks a job stopped by the operator. It is stored in Job.Error
+// and compared against by fail(), so it must be a single shared constant: two
+// copies of the literal would silently drift apart and the guard that preserves
+// this message would stop matching.
+const errJobcanceled = "job canceled by user"
+
 type Config struct {
 	Port           string
 	DataDir        string
@@ -74,7 +80,7 @@ type Config struct {
 	// default because aerial surveys are captured in flight order, which makes
 	// the exhaustive all-pairs search largely redundant work.
 	Matcher string
-	// MatcherOverlap is the number of neighbouring images each image is matched
+	// MatcherOverlap is the number of neighboring images each image is matched
 	// against when Matcher is "sequential".
 	MatcherOverlap int
 	// Threads is the worker count handed to COLMAP and OpenMVS. Zero or less
@@ -83,6 +89,12 @@ type Config struct {
 	// MaxImageSize caps the long edge fed to SIFT extraction. Lower values are
 	// faster but find fewer features.
 	MaxImageSize int
+	// TileGrid is the PagedLOD tile grid dimension per axis. Zero means choose
+	// it from the model's triangle count.
+	TileGrid int
+	// LODLevels is the per-tile LOD chain depth. Zero means choose it from the
+	// per-tile face count.
+	LODLevels int
 }
 
 // resolveThreads returns the worker count to pass to subprocesses.
@@ -148,6 +160,8 @@ func loadConfig() Config {
 		MatcherOverlap: int(envInt64("COLMAP_MATCHER_OVERLAP", 10)),
 		Threads:        int(envInt64AllowZero("PIPELINE_THREADS", 0)),
 		MaxImageSize:   int(envInt64("SIFT_MAX_IMAGE_SIZE", 3200)),
+		TileGrid:       int(envInt64AllowZero("TILE_GRID", 0)),
+		LODLevels:      int(envInt64AllowZero("LOD_LEVELS", 0)),
 	}
 }
 
@@ -563,9 +577,9 @@ func (m *JobManager) cancelJob(id string) error {
 	m.update(id, func(job *Job) {
 		job.Status = "failed"
 		job.Phase = phaseFailed
-		job.Error = "job cancelled by user"
+		job.Error = errJobcanceled
 	})
-	m.logLine(id, "system", "job cancelled by user")
+	m.logLine(id, "system", errJobcanceled)
 	return nil
 }
 
@@ -1217,9 +1231,10 @@ func convertFullmeshFaceIndicesToUnsignedByte(path string) error {
 		os.Remove(temp)
 		return err
 	}
-	info, err := os.Stat(path)
-	if err == nil {
-		os.Chmod(temp, info.Mode())
+	// Best effort: preserve the original file mode. A failure here only affects
+	// permissions, never the data, so it must not abort the rewrite.
+	if info, statErr := os.Stat(path); statErr == nil {
+		_ = os.Chmod(temp, info.Mode())
 	}
 	if err := os.Rename(temp, path); err != nil {
 		os.Remove(temp)
@@ -1300,9 +1315,10 @@ func rewriteFaceCountsToUint8(path string, header *plyHeader, faceProperty strin
 		os.Remove(temp)
 		return err
 	}
-	info, err := os.Stat(path)
-	if err == nil {
-		os.Chmod(temp, info.Mode())
+	// Best effort: preserve the original file mode. A failure here only affects
+	// permissions, never the data, so it must not abort the rewrite.
+	if info, statErr := os.Stat(path); statErr == nil {
+		_ = os.Chmod(temp, info.Mode())
 	}
 	if err := os.Rename(temp, path); err != nil {
 		os.Remove(temp)
@@ -1765,11 +1781,20 @@ func (m *JobManager) runSmart3DPagedLOD(id, modelPath string) error {
 		return fmt.Errorf("job output path is empty")
 	}
 	outDir := filepath.Dir(outputPath)
-	m.logLine(id, "system", fmt.Sprintf("Building Smart3D PagedLOD tree: model=%s outDir=%s grid=16x16", modelPath, outDir))
 	logFn := func(msg string) {
 		m.logLine(id, "system", msg)
 	}
-	if err := buildSmart3DOSGB(mesh, texMap, m.config.OSGConvBin, outDir, 16, 16, logFn); err != nil {
+	// Size the tile grid and LOD depth from the model unless the operator
+	// pinned them. A fixed 16x16 grid wasted work on small models (hundreds of
+	// empty tiles) while leaving large models with oversized tiles.
+	opts := resolveTreeOptions(len(mesh.triangles), m.config.TileGrid, m.config.LODLevels, logFn)
+	m.logLine(id, "system", fmt.Sprintf(
+		"Building Smart3D PagedLOD tree: model=%s outDir=%s faces=%d grid=%dx%d lod_levels=%d",
+		modelPath, outDir, len(mesh.triangles), opts.GridX, opts.GridY, opts.LODLevels))
+	if opts.GridX <= 0 || opts.GridY <= 0 || opts.LODLevels <= 0 {
+		return fmt.Errorf("resolved an invalid tree layout: grid=%dx%d levels=%d", opts.GridX, opts.GridY, opts.LODLevels)
+	}
+	if err := buildSmart3DOSGBWithOptions(mesh, texMap, m.config.OSGConvBin, outDir, opts); err != nil {
 		return fmt.Errorf("build Smart3D PagedLOD: %w", err)
 	}
 	logFn("Validating Smart3D PagedLOD tree...")
@@ -1889,7 +1914,7 @@ func safeCheckpointName(name string) string {
 }
 
 func (m *JobManager) fail(id string, err error) {
-	if current := m.snapshot(id); current != nil && current.Status == "failed" && current.Error == "job cancelled by user" {
+	if current := m.snapshot(id); current != nil && current.Status == "failed" && current.Error == errJobcanceled {
 		return
 	}
 	m.update(id, func(job *Job) {
@@ -1939,6 +1964,11 @@ func (m *JobManager) runCommand(id, binary, argTemplate string, vars map[string]
 		return fmt.Errorf("command %q not found: %w", binary, err)
 	}
 	m.logLine(id, "system", fmt.Sprintf("Running: %s %s", resolved, strings.Join(args, " ")))
+	// The context is intentionally rooted at Background rather than derived from
+	// any HTTP request: a job is a long-running background task that must
+	// survive the browser closing the page or refreshing it. Cancellation comes
+	// from two explicit sources instead -- the per-command timeout below, and
+	// m.cancel[id] when the operator stops the job via the API.
 	ctx, cancel := context.WithTimeout(context.Background(), m.config.CommandTimeout)
 	defer cancel()
 	m.mu.Lock()
@@ -1978,7 +2008,7 @@ func (m *JobManager) runCommand(id, binary, argTemplate string, vars map[string]
 	waitErr := cmd.Wait()
 	readers.Wait()
 	if ctx.Err() != nil {
-		return fmt.Errorf("command %s timed out or was cancelled: %w", binary, ctx.Err())
+		return fmt.Errorf("command %s timed out or was canceled: %w", binary, ctx.Err())
 	}
 	if waitErr != nil {
 		return fmt.Errorf("command %s failed: %w", binary, waitErr)
@@ -1999,7 +2029,7 @@ func (m *JobManager) scanOutput(id, stream string, reader io.Reader, readers *sy
 	}
 }
 
-func (m *JobManager) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (m *JobManager) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "go": runtime.Version()})
 }
 
@@ -2811,7 +2841,7 @@ func inspectInputPath(inputPath string) (int, int64, error) {
 	}
 	count := 0
 	var bytes int64
-	err = filepath.WalkDir(scanRoot, func(path string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(scanRoot, func(_ string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -2875,7 +2905,7 @@ func expandArgs(template string, vars map[string]string) ([]string, error) {
 	return tokens, nil
 }
 
-// tokenize splits a command template into argv, honouring single and double
+// tokenize splits a command template into argv, honoring single and double
 // quotes.
 //
 // Backslash handling is deliberately conservative because these templates carry

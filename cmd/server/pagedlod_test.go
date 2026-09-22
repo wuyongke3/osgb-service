@@ -147,8 +147,8 @@ func TestSimplifyPreservesBoundary(t *testing.T) {
 	}
 }
 
-// TestSimplifyWithoutToleranceMovesBoundary documents the behaviour that the
-// tolerance parameter exists to fix: with tolerance 0 (the legacy behaviour)
+// TestSimplifyWithoutToleranceMovesBoundary documents the behavior that the
+// tolerance parameter exists to fix: with tolerance 0 (the legacy behavior)
 // clustering is free to pull the silhouette inwards.
 func TestSimplifyWithoutToleranceMovesBoundary(t *testing.T) {
 	mesh := makeGridMesh(16)

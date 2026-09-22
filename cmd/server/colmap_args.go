@@ -11,7 +11,7 @@ package main
 // 2. COLMAP renamed its SIFT option groups. Up to and including 3.9 the options
 //    live under --SiftExtraction.* / --SiftMatching.*; from 4.x the processing
 //    switches moved to --FeatureExtraction.* / --FeatureMatching.*, and passing
-//    the old spelling is a hard error ("unrecognised option"), not a warning.
+//    the old spelling is a hard error ("unrecognized option"), not a warning.
 //    The two spellings are mutually exclusive, so no single fixed string works
 //    on both. The deployment image ships COLMAP 3.9.1 while a developer machine
 //    may have 4.2, so the correct group is detected once per binary and cached.

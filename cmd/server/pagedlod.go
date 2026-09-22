@@ -67,7 +67,7 @@ func parseObjTextured(path string) (*objMesh, error) {
 		mat   int
 	}
 	var rawFaces []rawFace
-	var curMat int = -1
+	curMat := -1
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
@@ -369,7 +369,7 @@ func simplifyMesh(src *objMesh, targetFaces int) *objMesh {
 // positions and the tree does not open cracks between tiles.
 //
 // Passing boundaryTolerance == 0 reproduces the original cluster-everything
-// behaviour.
+// behavior.
 func simplifyMeshPreservingBoundary(src *objMesh, targetFaces int, boundaryTolerance float64) *objMesh {
 	if len(src.triangles) <= targetFaces {
 		return src
@@ -440,7 +440,9 @@ func simplifyMeshPreservingBoundary(src *objMesh, targetFaces int, boundaryToler
 	// which cannot collide with the non-negative grid coordinates.
 	nextLocked := -1
 	for vi, v := range src.vertices {
-		if locked != nil && locked[vi] {
+		// Check the length rather than only for nil: indexing a shorter slice
+		// would panic, and the caller is free to pass any slice-length policy.
+		if vi < len(locked) && locked[vi] {
 			key := [3]int{nextLocked, 0, 0}
 			nextLocked--
 			cluster[vi] = key
@@ -589,7 +591,7 @@ func writeTexturedOBJ(mesh *objMesh, texMap map[string]string, objPath string) e
 		}
 		mtl.WriteString("\n")
 	}
-	if err := os.WriteFile(mtlPath, []byte(mtl.String()), 0644); err != nil {
+	if err := os.WriteFile(mtlPath, []byte(mtl.String()), 0o644); err != nil {
 		return fmt.Errorf("write MTL: %w", err)
 	}
 

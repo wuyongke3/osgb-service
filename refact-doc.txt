@@ -179,10 +179,34 @@ OSGB-SERVICE 重构与优化跟踪文档
           TestTileNameWidthFloor。
     状态: [x] 已完成
 
-[9] pagedlod_tree.go:331 固定 3 级 LOD + 固定 4 倍比例, 无体积预算
+[9] pagedlod_tree.go 固定 3 级 LOD + 固定 16x16 网格, 无体积预算
     问题: 16x16=256 瓦片 × 3 级 = 最多 768 次 osgconv 调用, 且不分模型
-          大小。小模型产生大量空瓦片警告, 大模型单瓦片仍可能过大。
-    状态: [ ] 待办
+          大小。小模型产生大量空瓦片警告, 大模型单瓦片仍可能过大;
+          threshold = radius * 2^(2-li) 的公式只对"恰好 3 级"成立。
+    修复: 新增自适应布局 + 通用 N 级链路, 并严格保持向后兼容:
+          - resolveTreeOptions(triangles, gridSetting, lodSetting):
+              gridSetting > 0 时用运维值, 否则 adaptiveGridSize() 按
+              "每瓦片目标约 12 万面"反推边长, 钳制在 [4, 24]
+              lodSetting > 0 时用运维值, 否则 adaptiveLODLevels() 按
+              每瓦片面数给出 1~5 级
+          - buildTileLODLevels(mesh, tolerance, levelCount): 通用 N 级,
+              每级面数按 4 倍递减(与原有 1/4、1/16 一致);
+              与相邻级面数相同的级会被丢弃(避免多加文件与 3 次 osgconv
+              却无视觉收益), 末级永远是未简化的完整网格
+          - lodSwitchThreshold(radius, li, levelCount): 通用公式,
+              已用测试锁定"3 级时与原 radius*2^(2-li) 逐值相等",
+              每级阈值严格减半, 最细级恰为 radius; shift 上限 20 防溢出
+          - 新增 TILE_GRID / LOD_LEVELS 配置, 默认 0 = 自适应;
+              设 TILE_GRID=16 + LOD_LEVELS=3 即可完全复现旧行为
+          - buildSmart3DOSGB 保留原签名(转发到 ...WithOptions),
+              4 个既有调用点与测试均未改动
+    实测(本地诊断): 500 面模型 -> 网格 4, 1 级; 100 万面 -> 网格 4, 3 级;
+          3000 万面 -> 网格 16, 3 级; 显式 grid=16/lod=3 时原样生效。
+          另做了 8x5 组网格/级数组合的单调性不变式检查, 违规 0 例。
+    新增测试 15 个: 网格与级数的边界/单调/退化保护, 显式值优先,
+          链路形状与旧行为一致(锁定 3 级 4 倍递减), 空网格不 panic,
+          阈值公式与旧公式逐值相等、每级减半、最细级等于 radius、防溢出。
+    状态: [x] 已完成
 
 [10] main.go:1713 只要 1 个瓦片失败即整个任务失败
     问题: 256 瓦片中 1 个纹理异常就丢弃全部成果, 无部分交付能力。
@@ -312,7 +336,38 @@ OSGB-SERVICE 重构与优化跟踪文档
     状态: [ ] 待办
 
 [17] 无 lint / 格式化配置(无 .golangci.yml, 无 prettier)
-    状态: [ ] 待办
+    修复: 新增 .golangci.yml 并接入 golangci-lint v1.64.8, 首次运行即发现
+          若干值得处理的真实问题:
+          (a) pagedlod_tree.go 的 pagedlod 统计里
+              `if m == "DrawArrays" { faces += n/3 } else { faces += n/3 }`
+              两个分支完全相同 —— dupBranchBody。说明作者曾以为索引绘制
+              与非索引绘制需要不同换算, 实际两者都是"每 3 个元素一个面"。
+              已合并并加注释说明。
+          (b) nilerr: validateSmart3DTree 中单个瓦片校验出错时返回 nil
+              继续遍历(这是对的, 一个坏瓦片不该中断全树校验), 但该瓦片
+              被静默排除在 allStats 之外 —— 结果"校验失败数"可能为 0,
+              而实际存在无法读取的瓦片, 部分交付阈值也就看不到它们。
+              已改为把该瓦片以 Valid=false 记入报告。
+          (c) errorlint: runOSGConvQuiet 用 %v 包装错误, 丢失 %w 的
+              errors.Is/As 能力, 已改为 %w。
+          (d) weakCond: `locked != nil && locked[vi]` 改为 `vi < len(locked)`,
+              避免切片长度不足时索引 panic。
+          (e) errcheck: 两处 os.Chmod 未检查; 已改为显式 `_ =` 并注明
+              "仅影响权限不影响数据, 不应中断重写"。
+          (f) 命名常量: "job cancelled by user" 这个字符串在 fail() 中
+              被比较(第 1911 行), 却以字面量重复 3 次 —— 任何一处笔误
+              都会让"保留取消消息"的保护静默失效。已提取为
+              errJobCancelled 常量。
+          (g) misspell/revive/unused-parameter 等风格项一并清理。
+    说明: 有两类告警经审查后判定为"有意为之", 已在配置中带理由豁免,
+          而非修改代码:
+          - contextcheck 报作业未传递 HTTP 请求 context。这是刻意设计:
+            重建任务要跑数小时, 必须在浏览器关闭/刷新后继续存活。
+            取消由 per-command 超时与 m.cancel[id] 注册表显式驱动。
+          - shadow 报惯用的 `if err := f(); err != nil`。逐条核对过,
+            外层 err 都在内层声明前已被处理, 无值丢失。
+    现状: golangci-lint run ./... 零告警。
+    状态: [x] 已完成
 
 --- P3 文档 ------------------------------------------------------------------
 

@@ -38,12 +38,12 @@ func TestDownscaleRealTexture(t *testing.T) {
 
 // TestDownscaleBoxDownsamplesToLimit exercises the pure-Go downscale path
 // without needing a real survey texture on disk. It checks the two properties
-// callers depend on: the output honours maxDim, and an in-limit image is copied
+// callers depend on: the output honors maxDim, and an in-limit image is copied
 // through byte-for-byte instead of being re-encoded.
 func TestDownscaleBoxDownsamplesToLimit(t *testing.T) {
 	dir := t.TempDir()
 
-	// Build a 64x32 PNG with a two-colour checker so averaging is observable.
+	// Build a 64x32 PNG with a two-color checker so averaging is observable.
 	src := image.NewRGBA(image.Rect(0, 0, 64, 32))
 	for y := 0; y < 32; y++ {
 		for x := 0; x < 64; x++ {
