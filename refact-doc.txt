@@ -1,0 +1,661 @@
+================================================================================
+OSGB-SERVICE 重构与优化跟踪文档
+================================================================================
+创建时间: 2026-02-12 (初次分析)
+维护方式: 每完成一项优化, 立即更新该项的 [状态] 并在文末"变更日志"追加一行
+状态取值: [ ] 待办   [~] 进行中   [x] 已完成   [-] 已放弃(须写明原因)
+验证基线: go build ./... ; go test ./cmd/server/
+================================================================================
+
+
+第 0 节  项目功能模块总览
+================================================================================
+
+代码规模
+  cmd/server/main.go              2733 行   配置/任务/计划管理 + 流水线编排 + PLY 修复 + HTTP API
+  cmd/server/pagedlod_tree.go      672 行   PagedLOD 树构建 + 纹理降采样 + OSGB 校验与报告
+  cmd/server/pagedlod.go           541 行   OBJ 解析 + 网格分块 + 网格简化 + OBJ 导出
+  cmd/server/pagedlod_test.go      259 行   单元测试 + 依赖真实 osgconv 的集成测试
+  cmd/server/main_test.go           56 行   PLY 头重写测试
+  cmd/server/pagedlod_real_test.go  45 行   真实数据端到端测试(env 开关)
+  cmd/server/pagedlod_downscale_test.go 33 行 真实纹理降采样测试(env 开关)
+  frontend/src/App.vue             156 行   Vue3 单文件组件(整页 UI)
+  frontend/src/style.css           约 13 KB  样式
+  web/                             编译产物, 由 Go 静态托管
+  Dockerfile                       184 行   三阶段构建(web/server/openmvs) + runtime 层
+  compose.yaml                              单容器 + 12G 内存上限 + /data 卷
+
+模块划分(共 8 个)
+  M1 配置模块        loadConfig / envOr / envInt64 / loadDotEnv / toolPaths
+                     writeToolConfig / updateToolPaths / ConfigFile 持久化
+  M2 任务与计划模块  JobManager / Job / Plan / Upload / 持久化(原子 rename)
+                     计划调度器 runPlanScheduler / createPlan / startPlan
+                     检查点 checkpointExists / writeCheckpoint / safeCheckpointName
+  M3 流水线编排模块  run / runNative / runDenseToOSGB / runExternal
+                     runCommand / scanOutput / setPhase / fail / humanizeJobError
+  M4 OSGB 分层模块   parseObjTextured / parseMTL / computeBounds / tileTriangles
+                     extractSubMesh / simplifyMesh / writeTexturedOBJ
+                     buildSmart3DOSGB / writePagedLODOSGT / osgMetadataBlock
+                     renumberUniqueIDs / extractGeodeBlock
+  M5 校验模块        validateOSGBInput / validateOSGBOutput / parseOSGTStats
+                     validateOSGBTile / validateSmart3DTree / writeValidationReport
+  M6 PLY 兼容模块    readPlyHeader / plyFaceProperty / sizeOfType
+                     convertFullmeshFaceIndicesToUnsignedByte
+                     rewriteFaceCountsToUint8 / normalizeOpenMVSPly
+  M7 HTTP API 模块   handleHealth / handleConfig / handlePickDirectory / handleUpload
+                     handlePlans / handleJob(jobRoutes) / handleEvents(SSE)
+                     handleDownload / handleCancel / serveStatic
+  M8 前端模块        App.vue 单页: 创建计划 / 实时监控 / 工具配置 / 成果下载
+
+
+第 1 节  优化项清单
+================================================================================
+
+--- P0 明确缺陷(功能受损, 必须修) -------------------------------------------
+
+[1] main.go:1458,1468,1593,1602 错误信息前缀被替换为占位符
+    现状: m.fail(id, fmt.Errorf("[UTF8 text removed]: %w", err))
+    问题: 早前一次"去除非 ASCII 文本"的清理误伤了中文提示语, 4 处
+          Georef/LOD 阶段的失败前缀变成无意义英文占位符, 用户看到
+          "[UTF8 text removed]: exit status 1" 无法定位失败原因。
+    修复: 恢复为有意义的英文前缀(保持源文件 ASCII 一致性):
+          - 坐标检查失败 -> "georeference and CRS check failed: %w"
+          - LOD 前处理失败 -> "optional LOD preprocessing failed: %w"
+          (runNative 与 runDenseToOSGB 各 2 处, 共 4 处)
+    状态: [x] 已完成
+
+[2] main.go:1462,1472,1597,1606 日志占位符 "OpenMVS or LOD message"
+    现状: m.logLine(id, "system", "OpenMVS or LOD message")
+    问题: 与 [1] 同源。else 分支本意是"未配置可选工具, 跳过该阶段",
+          却输出一句毫无信息量的占位文本, 用户无法判断是否正常跳过。
+    修复: 改为明确说明跳过原因, 共 4 处:
+          - GEOREF 未配置 -> "No georeference tool configured (GEOREF_BIN is
+            empty); skipping CRS check"
+          - LOD 未配置 -> "No external LOD tool configured (LOD_BIN is
+            empty); the built-in Smart3D PagedLOD builder will produce the tree"
+    状态: [x] 已完成
+
+[3] main.go:1517 日志占位符 "[UTF8 text removed]"
+    问题: runDenseToOSGB 中检测到已有 dense.mvs 时本应提示"复用已有稠密
+          结果", 现在输出占位符, 用户不知道是否真的跳过了耗时阶段。
+    修复: "Reusing existing dense.mvs; skipping dense reconstruction"
+          (该分支正是 README 中 resume-dense 快速路径的可见证据)
+    状态: [x] 已完成
+
+[4] main.go:2655,2657 Windows 目录选择框中文串为 GBK 乱码
+    现状: '闂備緡鍋勯ˇ鎵偓?OSGB 闁哄鐗婇幐鎼佸吹椤垹妫橀柛銉檮椤?'
+    问题: 这是典型的 UTF-8 字节被按 GBK 解读产生的乱码(mojibake)。弹窗
+          标题在 Windows 上显示为方块/乱码, 属于真实可见的 UI 缺陷。
+          已实测确认: 原始字节含 U+FFFD 丢失位与 '?' 替换位, 不可逆还原。
+    修复: 重写为纯 ASCII 英文标题, 并加注释说明为何必须 ASCII
+          (脚本经 -Command 传给 PowerShell, 非 ASCII 会被代码页转换破坏):
+          - 输出选择 -> 'Choose the OSGB output file (for example root.osgb)'
+          - 目录选择 -> 'Choose the folder containing the flight images for
+            reconstruction'
+    状态: [x] 已完成
+
+[5] main.go:674 与 1437/1570 中英文混杂, 日志语言不一致
+    问题: 同一份任务日志里既有 "Running: colmap ..." 等英文, 也有
+          "恢复检查点：跳过已完成阶段 - xxx", 前端日志面板混杂中英。
+    修复: 统一为英文, 共 3 处:
+          - 检查点跳过 -> "Checkpoint found, skipping completed step: <name>"
+            (runNative/runDenseToOSGB 各 1 处)
+          - 服务中断提示 -> "The service stopped while this job was running;
+            resume from the last successful checkpoint."
+    保留说明: 面向用户 UI 的中文保持不动(toolPaths 的 Label、humanizeJobError
+          的中文建议、deploymentSnapshot 的 note), 这些是刻意设计的中文
+          UI 文案, 且前端为中文界面。
+    状态: [x] 已完成
+
+--- P1 正确性/健壮性 ---------------------------------------------------------
+
+[6] pagedlod.go:242 tileTriangles 仅按 XY 质心分块
+    问题: 陡峭地形/崖壁/悬垂结构的三角形按水平投影错分, 同一瓦片内可能
+          混入垂直方向相距很远的几何, 导致包围球虚大、LOD 切换阈值失真。
+    决策: 不改变分块归属。XY 分块是 Smart3D/S3C 的瓦片寻址约定, 改成
+          八叉树会破坏与既有查看器/命名体系的兼容性, 风险远大于收益。
+          因此本项按"可诊断化"处理, 而非改变算法。
+    修复: 新增 tileZSpread(mesh, bounds, tiles, gridX, gridY), 计算所有
+          非空瓦片中"瓦片 Z 跨度 / 瓦片水平footprint"的最大比值:
+            <= 1  表示瓦片内地形基本平坦, XY 网格适配良好
+            >> 1  表示存在高大垂直结构(崖面/建筑立面/悬垂), 单个瓦片
+                  的垂直跨度远大于地图投影footprint, 包围球会虚大,
+                  进而使 PagedLOD 切换阈值偏大、粗层级停留过久
+          buildSmart3DOSGB 在比值 > 1 时向任务日志输出一条说明, 让该
+          情况可见可查, 而不是默默产出切换行为异常的树。
+          该值为诊断信息, 不置任务失败, 不改变产物。
+    实测验证: 平面网格比值 = 0; 注入一个 z=100 的垂直墙后比值 = 25.00。
+    新增测试: TestTileZSpreadFlatAndSteep, TestTileZSpreadEmptyInputs。
+    后续可选(未做): 若需真正改进, 可对 Z 跨度超阈值的瓦片做二次竖直细分,
+          或改用八叉树并按 S3C 兼容命名输出; 属独立特性, 不在本次范围。
+    状态: [x] 已完成
+
+[7] pagedlod.go:308 simplifyMesh 为顶点聚类, 无边界保护
+    问题: 聚类简化在瓦片边界处自由移动顶点, 相邻瓦片各简各的, 产生裂缝;
+          且 L0(1/16 面)在低面数瓦片上会退化为几乎无几何。
+    实测证据(新测试 TestSimplifyWithoutToleranceMovesBoundary):
+          16x16 平面网格, 原始包围盒 [0,0]-[16,16], 容忍度=0 时简化后
+          变成 [1.5,1.5]-[14.5,14.5] —— 边界向内收缩 1.5 个单位,
+          相邻瓦片各收缩各的, 就是裂缝的直接来源。
+    修复: 新增 simplifyMeshPreservingBoundary(src, targetFaces,
+          boundaryTolerance), 把位于包围盒边界带内的顶点"锁定":
+          不参与聚类、位置保持原样(每个锁定顶点自成一个单元素簇,
+          质心计算天然等于自身)。simplifyMesh 保留为薄封装(默认 0 容忍),
+          不破坏既有调用与测试。
+          新增 helper tileBoundaryTolerance(mesh) = 包围盒最大边长 / 64,
+          由瓦片自身尺度推导, 因此对米/英尺/OpenMVS 局部坐标都自适应;
+          退化(零尺寸)网格返回 0 即自动关闭锁定。
+          buildSmart3DOSGB 的 L1/L2 两级简化均改为调用新函数。
+    过程中发现并修复的次生缺陷:
+          最初实现无条件对 X/Y/Z 三轴做边界判定, 但平面瓦片(z 全等)
+          的每个顶点都同时落在 Z 的两个面上, 导致整个瓦片被全部锁定,
+          简化完全失效(实测 512 面 -> 512 面, 零简化)。
+          已改为仅对"网格在该轴确有延展"的方向生效
+          (lockX/lockY/lockZ = 该轴长度 > 容忍度)。
+          修复后实测: 2048 面网格 target=256 时得 254 面, 且边界不变。
+    新增测试: TestSimplifyPreservesBoundary(边界不变 + 面数确实下降),
+          TestSimplifyWithoutToleranceMovesBoundary(记录旧行为),
+          TestSimplifiedMeshStillTiles(简化后分块不丢面),
+          TestTileBoundaryToleranceDegenerate(空/单点网格返回 0)。
+    状态: [x] 已完成
+
+[8] pagedlod_tree.go 瓦片命名 "Tile_+%03d_+%03d" 硬编码 '+'
+    问题: 行/列永远带 '+' 号, 与 Smart3D 真实命名(负方向为 '-')不符,
+          且在 gridX/gridY > 999 时 %03d 溢出破坏排序。
+    修复: 新增 tileName(row, col, width) + padSigned() + tileNameWidth():
+          - 符号由实际值决定(-12 -> "-012"), 支持负原点
+          - 宽度由 tileNameWidth(gridX, gridY) 统一给出, 两轴同宽,
+            默认下限 3, 因此 16x16 常规网格输出与旧格式完全一致
+            (Tile_+003_+012 保持不变, 有测试锁定)
+          - 网格 > 999 时整体加宽到 4 位, 不再溢出
+    过程中发现的次生问题: 第一版实现"按需加宽"(每轴独立取最小宽度),
+          结果 999 用 3 位而 1000 用 4 位, 字符串排序把 1000 排到 999
+          前面 —— 正是本项要修的排序问题换了个形式重现。
+          由新增的 TestTileNameSortsNumerically 捕获(跨 3/4 位边界排序),
+          遂改为"整树统一宽度"。
+    新增测试: TestTileNamePreservesLegacyFormat(锁定旧格式兼容),
+          TestTileNameHandlesOverflowAndNegative,
+          TestTileNameSortsNumerically(跨宽度边界排序),
+          TestTileNameWidthFloor。
+    状态: [x] 已完成
+
+[9] pagedlod_tree.go:331 固定 3 级 LOD + 固定 4 倍比例, 无体积预算
+    问题: 16x16=256 瓦片 × 3 级 = 最多 768 次 osgconv 调用, 且不分模型
+          大小。小模型产生大量空瓦片警告, 大模型单瓦片仍可能过大。
+    状态: [ ] 待办
+
+[10] main.go:1713 只要 1 个瓦片失败即整个任务失败
+    问题: 256 瓦片中 1 个纹理异常就丢弃全部成果, 无部分交付能力。
+          对一次跑十几小时的任务, 这是很实际的损失。
+    修复: 抽出纯函数 checkTileFailureTolerance(failed, total) 承载策略,
+          便于单元测试(原先阈值内联在流水线里, 无法直接验证):
+            - failed == 0            -> 通过
+            - failed == total        -> 失败(全坏不可交付)
+            - failed/total > 10%     -> 失败(损坏过多)
+            - 其余                   -> 通过, 部分交付
+          新增常量 maxFailedTileRatio = 0.10 与 maxReportedFailedTiles = 10。
+          通过时向日志输出:
+            - "VALIDATE SUMMARY: N of M tiles failed validation (x.xx%);
+               details: <前10个失败的瓦片名与原因>"
+            - "Continuing with partial delivery: X valid tiles retained,
+               Y failed tiles skipped"
+          失败时的错误信息包含 failed/total 与比例, 并附前 10 个失败详情,
+          便于定位是否为系统性故障。
+          失败的瓦片明细同时仍写入 validation_report.json(原有行为不变),
+          job.Stats 的 valid_tiles/failed_tiles 也照常反映真实数量。
+    新增测试: TestCheckTileFailureTolerance(8 个子用例, 覆盖边界:
+          0 失败 / 1-of-256 容忍 / 恰好 10% / 略超 10% / 全失败 /
+          1-of-1 / total=0 等), TestCheckTileFailureToleranceErrorIsDescriptive。
+    状态: [x] 已完成
+
+[11] pagedlod_tree.go:229 downscaleTexture 为最近邻采样
+    问题: 无抗锯齿, 8K->2K 时纹理出现明显锯齿/摩尔纹。
+    修复: 新增 downscaleBox(), 改为区域平均(box filter)重采样:
+          每个输出像素对源图对应footprint内的全部像素做 RGBA 累加平均。
+          8K->2K 时源足迹为 4x4, 改前只取 1 个源像素(丢弃 15/16 内容),
+          改后平均全部 16 个, 屋顶边缘/路面标线的摩尔纹明显减少。
+          注意: RGBA() 返回 16 位值, 需 >>8 还原为 8 位再写入 RGBA 图。
+    状态: [x] 已完成
+
+[12] pagedlod_tree.go:229 downscaleTexture 失败时静默返回原名
+    问题: 返回 texName 表示"未降采样", 但调用方 writeTexturedOBJ 无法
+          区分, 会让 osgconv 去引用一个未拷贝的原始大纹理而失败, 或
+          悄悄交付超大/无纹理瓦片。错误被吞掉(共 6 处 return texName)。
+    修复: 签名改为 (string, error), 每处失败都返回带文件名的明确错误;
+          jpeg 编码/关闭失败时删除半成品文件, 不留损坏产物。
+          writeTexturedOBJ 相应改为:
+            - 目标贴图已存在 -> 跳过(幂等, 多瓦片共用贴图时避免重复解码)
+            - 源贴图不存在 -> 明确报错(此前静默跳过, 让 osgconv 事后才报错)
+            - downscale 失败 -> 直接返回错误
+          导致任务在写瓦片阶段就给出可定位的错误, 而不是等到 osgconv。
+    新增测试: TestDownscaleBoxDownsamplesToLimit(16x8 等比输出),
+          TestDownscaleTextureReportsMissingSource(缺源必须报错且不留文件),
+          TestWriteTexturedOBJFailsOnMissingTexture(调用方正确冒泡错误)。
+    状态: [x] 已完成
+
+--- P2 工程化/可维护性 -------------------------------------------------------
+
+[13] main.go 单文件 2733 行, 8 个模块混在一个文件
+    问题: 配置/任务/流水线/PLY/HTTP 全部堆在 main.go, 导航困难。
+    状态: [ ] 待办
+
+[14] 缺少流水线编排层的单元测试
+    问题: runNative/runDenseToOSGB 的检查点跳过逻辑、expandArgs 变量
+          替换、validateOutputPath 路径约束、safeUploadRelativePath 穿越
+          防护均无测试覆盖。
+    修复: 新增 cmd/server/orchestration_test.go (约 470 行, 41 个测试),
+          覆盖四条关键边界:
+          (a) 命令构造: expandArgs 占位符替换、含空格路径保持单参数、
+              空模板; tokenize 引号/转义/重复空格
+          (b) 上传路径安全: 穿越(../, ..\, a/../../)全部拒绝、
+              嵌套目录保留、前导斜杠安全剥离
+          (c) 输出路径约束: 必须绝对路径、OUTPUT_ROOT 内外判定、
+              前缀同名兄弟目录(root 与 root-sibling)必须拒绝 ——
+              这一条专门针对"朴素 HasPrefix 判断"的经典漏洞
+          (d) 任务生命周期: 崩溃后 running 任务被标记 failed+resumable、
+              已完成任务保持 completed 且不可 resume、损坏 job.json 被
+              跳过而不阻断启动、重启后 Job 可完整恢复、日志上限 5000、
+              计划 draft/scheduled 状态推导与持久化、
+              工具配置写入/保留无关键/任务运行中拒绝修改
+    测试中发现并修复的真实缺陷: 见 [19]。
+    状态: [x] 已完成
+
+--- 测试过程中新发现的缺陷 ------------------------------------------------
+
+[19] tokenize 把 Windows 反斜杠路径当转义符, 静默corrupt路径 (新发现)
+    位置: main.go tokenize()
+    问题: 原实现只要遇到 '\' 就置 escaped=true 并吞掉下一个字符, 因此
+          `-o "C:\data\job\out.mvs"` 被解析成单个 token
+          `C:datajobout.mvs` —— 反斜杠全部丢失, 路径彻底损坏。
+          由于 .env.example 与 Dockerfile 中的默认值全部使用正斜杠
+          (OSGCONV_BIN=E:/...) 或裸命令名, 该缺陷被长期掩盖; 但任何用户
+          按 Windows 习惯粘贴 `E:\OpenSceneGraph-3.6.5\bin\osgconv.exe`
+          都会中招, 且错误表现为"工具写到了奇怪的位置", 极难定位。
+    实测证据: tokenize(`tool -i "C:\data\job"`) 修复前输出 `C:datajob`。
+    修复: 改为"仅在下一字符确实特殊时才转义"的规则:
+          - 单引号内完全字面量
+          - '\' 仅当后跟 " \ ' 空格/Tab 时才作转义(保留 \" 与 "\ " 语义)
+          - 其余情况(如 C:\data 中的 '\')原样保留
+          - 行尾孤立 '\' 原样保留
+          修复后 `C:\data\job\out.mvs` 完整保留; UNC、含空格路径、
+          混合分隔符均正确。
+    已知限制(诚实记录, 非本次引入): `"C:\dir\"` 这种"引号前紧邻
+          反斜杠"的写法与转义引号本质歧义, 旧实现同样会误吞右引号并报
+          unterminated quote。已用测试
+          TestTokenizeTrailingBackslashBeforeQuoteIsAmbiguous 固化该行为,
+          避免误认为是回归。
+    新增测试 8 个: TestTokenizePreservesWindowsBackslashPaths(核心回归),
+          PreservesUNCPath, UNCPrefixWithEscapedBackslashes,
+          PreservesWindowsPathWithSpace, StillSupportsEscapedQuotes,
+          MixedSeparators, TrailingBackslashBeforeQuoteIsAmbiguous,
+          RejectsUnterminatedQuote。
+    状态: [x] 已完成
+
+[15] main.go:2553 randomToken 用时间戳做伪随机种子
+    问题: newID() = UnixNano + 6 字符 LCG token, 碰撞概率虽低但可预测;
+          任务 ID 同时用作目录名, 无并发唯一性硬保证(仅靠纳秒时间戳)。
+    修复: newID 改为 <UnixNano>-<原子计数器base36><crypto/rand 6字符>:
+          - 新增包级 atomic.Uint64 计数器, 覆盖"同一纳秒内多次调用",
+            这是原实现唯一的真实碰撞窗口
+          - randomToken 改用 crypto/rand, 不可预测; 熵源不可用时才回退
+            到 SplitMix 风格的时间种子生成器(保证不 panic)
+          - 新增 encodeBase36 保持 ID 简短(路径友好)
+          - 保留"仅含 [a-z0-9] 与 '-'"的字符集, 目录名安全
+    新增测试: TestNewIDIsUniqueUnderConcurrency(16 goroutine x 500 =
+          8000 个 ID, 断言零重复), TestNewIDIsFilesystemSafe(无路径分隔符
+          与 ".."), TestRandomTokenLengthAndAlphabet, TestRandomTokenVaries,
+          TestEncodeBase36。
+    状态: [x] 已完成
+
+[16] frontend/src/App.vue 单行多语句, 156 行压缩写法
+    问题: 每个函数写在单行, 可读性与可维护性差, 无法逐行 diff。
+    状态: [ ] 待办
+
+[17] 无 lint / 格式化配置(无 .golangci.yml, 无 prettier)
+    状态: [ ] 待办
+
+--- P3 文档 ------------------------------------------------------------------
+
+[18] README.md 与代码存在偏差
+    问题: README 提到 `POST /api/jobs/:id/resume-dense` 与 `POST
+          /api/jobs/:id/resume`, 但 API 表格只列了 resume-dense; 未提及
+          /cancel。另外 README 未说明第 [10] 项的部分失败策略。
+    核实: 逐条对照 main.go 的路由注册(2481-2489)与子路由(2150/2344/
+          2348/2364/2380/2384), 确认缺失 4 个接口:
+          PUT /api/config, GET /api/jobs, DELETE /api/jobs/:id/cancel,
+          POST /api/jobs/:id/resume。
+    修复: README 的 API 表补齐上述 4 个接口, 并新增 3 个小节:
+          - "瓦片校验与部分交付": 说明 0 / <=10% / >10% 三档策略
+          - "任务恢复": 说明检查点、resume、resume-dense 以及重启后
+            running 任务被标记为 failed+resumable 的行为
+          - "Smart3D 分层树的分块与简化": 说明 16x16 分块、3 级 LOD、
+            边界锁定防裂缝, 以及 tile vertical spread ratio 诊断的含义
+          - "Windows 路径写法": 说明正/反斜杠均可, 以及
+            `"C:\dir\"` 的歧义限制与规避方式
+    状态: [x] 已完成
+
+
+第 2 节  修复原则
+================================================================================
+  1. 每次只改一个模块, 改完立即 go build + go test, 保证始终可编译可测。
+  2. 不改变对外行为契约(API 响应结构、job.json 字段、目录布局)。
+  3. 源码保持 UTF-8; 面向日志/错误的字符串统一用英文, 避免跨平台编码问题。
+  4. 不引入任何第三方 Go 依赖(go.mod 保持单行 module)。
+  5. 每项修复必须可被验证: 要么有测试, 要么有明确的构建/运行证据。
+
+
+第 3 节  变更日志
+================================================================================
+  2026-02-12  建立文档; 完成 8 模块功能分析; 记录 18 项优化项;
+              基线验证: go build 通过, go test 通过(ok osgb-service/cmd/server)。
+
+  2026-02-12  批次 1 完成: P0 缺陷 [1][2][3][4][5] 全部修复 (main.go)
+              - 清除 9 处占位符("UTF8 text removed" ×5 / "OpenMVS or LOD
+                message" ×4), 替换为有意义的英文错误前缀与跳过说明
+              - 修复 Windows 目录/文件选择框的 GBK 乱码标题, 改为 ASCII
+              - 统一 3 处检查点/中断提示为英文
+              验证: go build exit=0; go vet exit=0;
+                    go test -count=1 ./cmd/server/ -> ok 4.141s
+              复查: 占位符残留 0 处, mojibake 残留 0 处
+              下一步: P1 正确性项 [6][7] (分块与简化的边界保护)
+
+  2026-02-12  批次 2 完成: P1 项 [7][11][12][6]
+              [7] simplifyMesh 边界保护(防裂缝) —— 核心修复
+                  - 新增 simplifyMeshPreservingBoundary, 锁定包围盒边界带
+                    顶点; simplifyMesh 保留为薄封装(容忍度 0), 行为兼容
+                  - 新增 tileBoundaryTolerance = 最大边长/64, 尺度自适应
+                  - 过程中发现次生缺陷: 无条件三轴判定会把平面瓦片(z 全等)
+                    全部锁定导致零简化(实测 512->512 面), 已改为仅对确有
+                    延展的轴生效; 修复后 2048 面网格 target=256 得 254 面
+                  - 实测裂缝证据: 容忍度 0 时包围盒 [0,0]-[16,16] 收缩为
+                    [1.5,1.5]-[14.5,14.5]
+              [11] 纹理降采样 最近邻 -> 区域平均(box filter), 消除摩尔纹
+              [12] downscaleTexture 签名改为 (string, error), 消除 6 处静默
+                   失败; writeTexturedOBJ 对缺失贴图明确报错
+              [6] 分块策略决策为"可诊断化"而非改算法(保持 S3C 兼容),
+                   新增 tileZSpread 并在日志报告垂直跨度比值
+              新增测试 9 个, 全部通过
+              验证: go build exit=0; go vet exit=0;
+                    go test -count=1 ./cmd/server/ -> ok 4.120s
+              下一步: P2 项 [14] 编排层单元测试, [8] 瓦片命名, [15] ID 生成
+
+  2026-02-12  批次 3 完成: P2 项 [8][15][14] + 新发现缺陷 [19]
+              [8]  瓦片命名改为 tileName/padSigned/tileNameWidth:
+                   保持旧格式兼容(Tile_+003_+012), 支持负数与 >999 溢出
+              [15] newID 增加原子计数器 + crypto/rand, 消除同纳秒碰撞窗口
+              [14] 新增 orchestration_test.go, 41 个测试覆盖命令构造、
+                   上传/输出路径安全、任务与计划生命周期持久化
+              [19] 新发现并修复: tokenize 把 Windows 反斜杠当转义符,
+                   导致 "C:\data\job" 被解析成 "C:datajob"(路径损坏)。
+                   已改为按需转义, 并固化"引号前紧邻反斜杠"的歧义限制。
+              测试规模: 19 -> 68 个通过(另有 2 个需真实数据/env 的跳过)
+              验证: go build exit=0; go vet exit=0;
+                    go test -count=1 ./cmd/server/ -> ok 16.991s
+              下一步: 批次 4 —— [9] LOD 级别自适应, [10] 部分交付,
+                    [13] main.go 拆分, [18] README 同步
+
+  2026-02-12  批次 4 完成: [10] 部分交付策略 + [18] README 同步
+              [10] 抽出纯函数 checkTileFailureTolerance(failed, total),
+                   策略: 0 失败通过 / 全部失败拒绝 / >10% 拒绝 / 其余部分
+                   交付并在日志与报告中列出失败瓦片明细。
+                   原先阈值内联在流水线中无法测试, 抽出后新增 9 个测试。
+              [18] 实测比对路由注册与 README, 补齐 4 个缺失接口
+                   (PUT /api/config, GET /api/jobs, cancel, resume),
+                   并新增 4 个小节说明部分交付、任务恢复、分块与简化、
+                   Windows 路径写法。
+              最终验证:
+                gofmt -l ./cmd/     -> 无未格式化文件
+                go build ./...      -> exit 0
+                go vet ./...        -> exit 0
+                go test -count=1 ./... -> ok (70 PASS / 2 SKIP / 0 FAIL)
+              代码规模变化:
+                main.go            2733 -> 2737 行
+                pagedlod.go         541 ->  619 行
+                pagedlod_tree.go    672 ->  788 行
+                main_test.go         56 ->  146 行
+                pagedlod_test.go    259 ->  443 行
+                pagedlod_downscale_test.go 33 -> 118 行
+                orchestration_test.go  新增 716 行
+
+  2026-02-12  批次 5 完成: 流水线性能优化 + 纯 CPU 保障
+              (用户要求: 全部用 CPU 计算, 在服务器 Docker 中运行)
+              [20] 新增 COLMAP_MATCHER(默认 sequential) + overlap:
+                   候选图像对 91,378 -> 4,280 (428 张影像), 减少 95%
+              [21] 新增 PIPELINE_THREADS 自动线程推导(GOMAXPROCS-1,
+                   上限 16), 取代全部硬编码的 4 线程
+              [22] 纯 CPU 强制: 每阶段显式 use_gpu=0 + runCommand 清空
+                   CUDA_VISIBLE_DEVICES; 删除本地 .env 中的 --cuda-device
+              [23] 修复关键缺陷: COLMAP 4.x 选项组改名(互斥,
+                   传错即 unrecoverable 失败)。新增运行时探测
+                   (colmap_args.go), 自动选择 SiftExtraction/SiftMatching
+                   或 FeatureExtraction/FeatureMatching
+              [24] 新增 SIFT_MAX_IMAGE_SIZE; 任务日志打印策略/图像对/线程数
+              [25] steps 表新增 argv 字段承载动态参数, 其余阶段不变
+              新增文件: cmd/server/colmap_args.go, colmap_args_test.go
+              测试规模: 70 -> 88 个通过 (新增 18 个)
+              验证: gofmt 清洁 / build exit 0 / vet exit 0 /
+                    88 PASS 0 FAIL 2 SKIP / docker compose config 通过 /
+                    Docker 镜像重建成功 / 容器内端到端实跑到 SfM 阶段,
+                    确认自动选中 legacy 拼写且 use_gpu 全为 0
+
+
+第 4 节  流水线性能优化 (用户要求: 全部使用 CPU, 在服务器 Docker 中运行)
+================================================================================
+
+背景: 用户询问"流程都是啥步骤, 为什么有的步骤运行慢"。基于真实 job 记录
+      runtime/jobs/1790051120838202276-9wj6dc (428 张影像 / 2.76 GB) 逐条还原
+      日志时间戳, 得到实测耗时, 而不是估算:
+
+        影像预处理            2.5 秒
+        特征提取          1,428.6 秒 (23.8 分钟)
+        特征匹配          单块 79~311 秒, 平均 252 秒/块
+                          COLMAP 把 428 张切成 9x9=81 块
+                          已完成 24 块时已耗 6,057 秒 (1.7 小时)
+                          线性外推全部 81 块约 5.7 小时
+
+      结论: 慢的不是 OSGB 阶段, 而是 COLMAP 前段, 且有两个可量化的根因。
+
+--- [20] 特征匹配使用穷举匹配 (O(n^2)) — 最大浪费 -------------------------
+    问题: 代码硬编码 exhaustive_matcher, 428 张图产生 428*427/2 = 91,378 个
+          图像对。航飞影像按航线顺序拍摄, 只有相邻帧才可能重叠, 穷举搜索
+          绝大部分是无用功。
+    修复: 新增 COLMAP_MATCHER 配置(默认 sequential), 支持
+          sequential / exhaustive / vocab_tree / spatial / transitive;
+          未知值安全回退到 exhaustive(永远正确, 只是慢)。
+          sequential 支持 COLMAP_MATCHER_OVERLAP(默认 10)。
+          实测候选图像对: 91,378 -> 4,280, 减少 95%。
+          两版本 COLMAP 均确认支持 --SequentialMatching.overlap:
+          - 本机 4.2.0 (CUDA) 与容器 3.9.1 均有该选项。
+    状态: [x] 已完成
+
+--- [21] 线程数硬编码为 4, 浪费绝大多数 CPU --------------------------------
+    问题: feature_extractor / exhaustive_matcher 都写死
+          --num_threads 4, OpenMVS 稠密重建写死 --max-threads 4。
+          本机 32 逻辑核, 相当于只用 12.5% 算力。
+          用户明确要求纯 CPU 运行, 因此线程数是主要性能杠杆, 必须放开。
+    修复: 新增 Config.resolveThreads():
+            - PIPELINE_THREADS > 0 时用它(运维显式值永远优先)
+            - 否则自动 = GOMAXPROCS-1, 最少 1, 上限 maxAutoThreads=16
+            - 留一核给 Go 的 HTTP 服务/日志读取/SSE goroutine
+            - 上限 16 的原因: COLMAP/OpenMVS 按线程分配缓冲, 容器有内存
+              上限, 无界并发会用速度换 OOM
+          应用到所有阶段: feature_extractor、matcher、
+          image_undistorter、ReconstructMesh、RefineMesh、TextureMesh。
+          OpenMVS 的 --max-threads 已从 .env.example / compose.yaml 的
+          DENSIFY_ARGS 字符串中移除, 改由代码统一注入(避免两处配置打架)。
+    状态: [x] 已完成
+
+--- [22] 强制 CPU-only, 任何阶段都不得使用 GPU ---------------------------------
+    问题: 用户要求"不要使用 gpu, 最终在服务器 docker 中都用 cpu 计算"。
+          经核查有四处 GPU 风险:
+            (a) COLMAP 的 use_gpu 默认值为 1, 不显式关闭会尝试 CUDA
+            (b) 本地 .env 的 OPENMVS_DENSIFY_ARGS 含有 --cuda-device -2
+                (compose.yaml 是正确的, 但本地已被污染)
+            (c) runCommand 未清除 CUDA_VISIBLE_DEVICES
+            (d) 无任何测试锁定"不得启用 GPU"这一约束
+    修复:
+          - 每条 COLMAP 命令都显式传 use_gpu=0(不依赖默认值)
+          - runCommand 统一注入 CUDA_VISIBLE_DEVICES="" (最强的跨平台
+            隐藏 GPU 手段), 作为参数层面的第二道保险
+          - 已删除本地 .env 中的 --cuda-device -2
+          - compose.yaml / .env.example / Dockerfile 的 DENSIFY_ARGS
+            均不含任何 cuda 参数
+          - Dockerfile 构建时输出 COLMAP 版本到 /opt/colmap-version.txt,
+            若检测到 CUDA 版构建则打印警告(容器内 3.9.1 为 without CUDA)
+    新增测试: TestFeatureExtractorForcesCPU, TestMatcherForcesCPU
+          (断言 use_gpu 0 必须存在, 且不得出现 cuda-device / use_gpu 1)。
+    状态: [x] 已完成
+
+--- [23] COLMAP 4.x 选项组改名导致特征提取/匹配必然失败 (严重) ----------------
+    问题: 这是本次分析中最重要的发现, 是真实功能性缺陷。
+          COLMAP 在 4.0 把 SIFT 处理相关选项从
+            --SiftExtraction.* / --SiftMatching.*
+          改名为
+            --FeatureExtraction.* / --FeatureMatching.*
+          且两组拼写互斥 —— 传错是硬错误("unrecognised option"), 直接退出,
+          不是警告。实测两个真实二进制:
+            本机 COLMAP 4.2.0 (with CUDA)
+              --SiftExtraction.use_gpu 0  -> FAILED, exit 1
+              --FeatureExtraction.use_gpu 0 -> 正常
+            容器 COLMAP 3.9.1 (without CUDA, 部署目标)
+              --SiftExtraction.use_gpu 0  -> 正常
+              --FeatureExtraction.use_gpu 0 -> FAILED
+          原代码写的是 --SiftExtraction.*(提取) 与 --SiftMatching.*(匹配):
+            - 在部署容器 3.9.1 上恰好可用, 所以 Docker 里看不出问题
+            - 但 --SiftMatching.use_gpu / num_threads 在 4.2.0 上不存在
+              (4.2.0 的 SiftMatching 组只剩 max_ratio / max_distance /
+               cross_check 等参数), 因此在 4.x 上特征提取必然失败
+            另注: 真实日志显示两次运行之间匹配参数被改过
+              (run1 用 --FeatureMatching.*, run2 用 --SiftMatching.*),
+              说明这一点此前被反复试错而未定型。
+    修复: 新增 cmd/server/colmap_args.go, 运行时探测而非硬编码版本号:
+            - detectColmapOptionStyle(binary) 执行
+              `colmap feature_extractor --help`, 检查输出里出现的是
+              --FeatureExtraction. 还是 --SiftExtraction., 据此选组
+            - 结果按二进制路径 memoise 到 sync.Map (探测要起子进程,
+              而参数每次建任务都会重建)
+            - 探测失败(二进制不存在/help 不支持)安全回退到 legacy 拼写,
+              因为固定部署镜像用的是 3.9.1
+            - 选择依据是"问二进制"而不是解析版本字符串: --help 输出格式
+              在版本间变化过, 猜错会让任务跑到中途才失败
+          实测生成结果:
+            现代: feature_extractor ... --FeatureExtraction.use_gpu 0
+                  --FeatureExtraction.num_threads N --FeatureExtraction.max_image_size 3200
+                  sequential_matcher ... --FeatureMatching.use_gpu 0
+                  --FeatureMatching.num_threads N --SequentialMatching.overlap 10
+            传统: 同样结构, 组名换成 SiftExtraction / SiftMatching
+          并已用真实二进制逐一验证两组 argv 都能被对应版本接受。
+    新增测试: TestOptionGroupNames, TestDetectStyleFallsBackForMissingBinary,
+          TestDetectStyleIsCached, TestGenerateArgsPerStyle (断言一次运行内
+          两个阶段的拼写风格自洽)。
+    状态: [x] 已完成
+
+--- [24] 新增 compute 参数透传与可观测性 --------------------------------------
+    修复:
+          - 新增 SIFT_MAX_IMAGE_SIZE(默认 3200); 设为 0 时不传该参数
+            (对应 COLMAP 自身 -1 语义), 避免发出非法的 0 值
+          - runNative 在昂贵阶段开始前输出两行日志:
+              "CPU-only: ... ; threads=N"
+              "matcher=sequential_matcher overlap=10, candidate image pairs=4280"
+            让"策略/规模/线程数"可见 —— 此前 24% 的进度条会卡近 6 小时
+            不动, 用户无法判断是慢还是卡死。
+          - runCommand 新增 argv 参数: 非 nil 时直接使用, 否则走原占位符
+            模板, 使动态参数与既有模板机制共存而不破坏其他 9 个调用点
+    状态: [x] 已完成
+
+--- [25] matcherArgs/steps 表注入方式 -----------------------------------------
+    说明: runNative 的 steps 表新增 argv 字段以承载运行时计算的参数,
+          其余阶段仍使用模板字符串。表格化的好处在此体现: 改动集中在
+          一处, 未触碰其余阶段的行为。
+    状态: [x] 已完成
+
+预期收益 (同批次 428 张影像):
+    匹配阶段   约 5.7 小时 -> 约 0.3~0.6 小时 (减少 95% 图像对)
+    特征提取   23.8 分钟 -> 理论上接近线性加速(4 线程 -> 最高 16 线程)
+    端到端     预计从十几个小时降到 2~3 小时量级
+
+验证情况 (已做 / 未做, 如实记录):
+  已做:
+    1. 用两个真实 COLMAP 二进制逐一验证 argv 可被接受:
+       - 本机 4.2.0 (with CUDA): modern 拼写通过, legacy 拼写报
+         "unrecognised option" 并退出 1
+       - 容器 3.9.1 (without CUDA): legacy 拼写通过, modern 拼写失败
+       => 证实"运行时探测"是必需的, 而非可选优化
+    2. 重新构建 Docker 镜像 (osgb-service:cpu-opt) 成功
+    3. 在容器内启动真实服务并提交任务, 抓取服务实际生成的命令:
+         CPU-only: ... threads=16
+         matcher=sequential_matcher overlap=10, candidate image pairs=100
+         colmap feature_extractor ... --SiftExtraction.use_gpu 0
+              --SiftExtraction.num_threads 16 --SiftExtraction.max_image_size 3200
+         colmap sequential_matcher ... --SiftMatching.use_gpu 0
+              --SiftMatching.num_threads 16 --SequentialMatching.overlap 10
+       => 容器内自动选中 legacy 拼写(正确), use_gpu 全为 0,
+          线程 16 来自 32 核自动推导(不再是硬编码 4)
+    4. 端到端跑通到 SfM 阶段: 特征提取成功, 匹配成功
+       (opencv 报告 42 组匹配, "Matching image [10/10]"),
+       随后 mapper 因测试图为随机噪声、无真实三维结构而正常退出
+       —— 属预期行为, 非缺陷
+    5. 88 个单元测试通过, gofmt/go vet 干净, docker compose config 通过
+
+  未做(需在服务器上用真实数据复核):
+    - 未用真实的 428 张航飞数据集重跑计时。一次完整运行需数小时, 本地
+      不具备条件。上述"5.7h -> 0.3~0.6h"是基于图像对数量(91,378 -> 4,280)
+      与线程数(4 -> 16)的推算, 不是实测值, 请以服务器实测为准。
+
+  排查过程中的一个插曲(已澄清, 非缺陷):
+    首次端到端测试在 matching 阶段崩溃, 报
+      "Check failed: max_num_matches > 0 (0 vs. 0)" + core dumped。
+    一度怀疑是新增的 --SequentialMatching.overlap 参数所致。
+    经隔离测试确认: 加/不加该参数都会崩溃, 因此与本改动无关。
+    真实原因是测试图过于退化(纯色小块, 10 张图只提取出 10 个关键点,
+    平均每张 1 个), COLMAP 3.9.1 在特征数近零时自身断言失败。
+    改用带纹理的图后 matching 正常产出 45~42 组匹配。
+    已排除该误报, 未对代码做相应"修复"。
+
+
+第 5 节  未完成项与后续建议
+================================================================================
+
+[9]  固定 3 级 LOD + 固定 4 倍比例, 无体积预算控制
+     现状: 16x16=256 瓦片 x 3 级 = 最多 768 次 osgconv 调用, 与模型大小无关。
+     不做原因: 自适应分级需要改变瓦片目录结构与 PagedLOD 引用关系, 会破坏
+          与既有成果/查看器的兼容性; 且缺少真实大模型基准数据来验证阈值,
+          贸然改动可能让现状(可用)变差。
+     建议: 若要推进, 先采集 2-3 个真实工程的瓦片面数与体积分布, 再据此
+          设计按面数/体积分级的策略, 并保留 16x16x3 作为默认档位。
+
+[13] main.go 单文件 2737 行, 8 个模块混在一个文件
+     不做原因: 纯结构性重构, 不改变行为但会让本次所有已完成的修复产生
+          大范围 diff, 与"每批次可独立验证"的原则冲突, 且无法用测试证明
+          等价性(Go 无内建结构等价检查)。
+     建议: 独立开一个重构分支单独做, 按 M1-M7 拆成 config.go / jobs.go /
+          pipeline.go / ply.go / api.go / utils.go, 依赖 go build + 全量
+          测试通过作为每一步的验收条件。
+
+[16] frontend/src/App.vue 单行多语句, 156 行压缩写法
+[17] 无 lint / 格式化配置(无 .golangci.yml, 无 prettier)
+     不做原因: 前端改动无法在本环境验证(需 npm build + 浏览器确认),
+          本次未触碰前端资源, 保持现状更稳妥。
+     建议: 若继续, 先拆 App.vue 为组件, 再引入 prettier; 注意
+          vite build 输出到 web/, 改完必须重新构建并刷新页面验证。
+
+
+================================================================================
+文档结束。
+当前状态:
+  已记录优化项      25 项 (原 18 项 + 测试发现的 [19] + 性能优化 [20]~[25])
+  已完成            21 项: [1]~[8] [10]~[12] [14][15] [18]~[25]
+  保留待决策         4 项: [9] LOD 自适应分级, [13] main.go 拆分,
+                          [16] App.vue 拆分, [17] lint/格式化配置
+                        (保留原因见各条目与第 5 节)
+  测试规模          19 -> 88 个通过 (另有 2 个需真实数据/env 的集成测试跳过)
+  最终验证          gofmt 清洁 / go build 通过 / go vet 通过 /
+                    go test -count=1 ./... 88 PASS 0 FAIL /
+                    docker compose config 通过 / Docker 镜像重建成功 /
+                    容器内真实服务端到端验证(自动选对 COLMAP 选项组、
+                    强制 CPU、线程自动推导)
+
+  待服务器复核: 用真实 428 张航飞数据实测匹配阶段提速倍数。
+                当前"减少 95% 图像对"是基于计数的事实,
+                但"5.7h -> 0.3~0.6h"的端到端时间是推算, 非实测。
+================================================================================

@@ -1,0 +1,60 @@
+# ---- Runtime data -----------------------------------------------------------
+# Per-job workspaces, uploaded imagery, plan records and delivered artifacts.
+# This tree grows to many gigabytes of survey data and intermediate products
+# (COLMAP databases, OpenMVS scenes, OSGB tiles) and must never be committed.
+runtime/
+runtime-smoke/
+tmp/
+tmp_smart3d/
+
+# Local input mount used by the "mounted directory" workflow.
+input/
+
+# ---- Local configuration ----------------------------------------------------
+# .env holds machine-specific tool paths (for example an absolute path to
+# osgconv.exe). The tracked template is .env.example.
+.env
+*.env.local
+
+# ---- Build output -----------------------------------------------------------
+# The Vite build emits the served frontend into web/. It is produced by
+# `npm run build` and rebuilt inside the Docker image, so it is not source.
+web/
+
+# ---- Frontend dependencies and generated files ------------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# ---- Test / scratch artifacts ----------------------------------------------
+_plod_test/
+_test_assets/
+*.bak
+*.orig
+*.rej
+
+# ---- Photogrammetry and 3D artifacts ---------------------------------------
+# These are pipeline products, never source. Kept broad on purpose: a stray
+# multi-gigabyte .ply or .osgb would otherwise be staged by `git add -A`.
+*.osgb
+*.osgt
+*.ply
+*.mvs
+*.dmap
+*.db
+*.db-shm
+*.db-wal
+*.zip
+
+# ---- Binaries and logs -----------------------------------------------------
+*.exe
+*.log
+
+# ---- Editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

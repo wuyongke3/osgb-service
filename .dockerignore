@@ -1,0 +1,16 @@
+.git
+frontend/node_modules
+runtime
+runtime-smoke
+tmp
+tmp_smart3d
+_plod_test
+_test_assets
+_fix*.py
+*.bak
+*.exe
+*.log
+*.osgb
+*.osgt
+*.ply
+*.zip

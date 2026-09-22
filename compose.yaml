@@ -1,0 +1,38 @@
+services:
+  osgb-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: osgb-service:latest
+    container_name: osgb-service
+    mem_limit: ${OSGB_MEMORY_LIMIT:-12g}
+    memswap_limit: ${OSGB_MEMORY_LIMIT:-12g}
+    shm_size: ${OSGB_SHM_SIZE:-1g}
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      CONFIG_FILE: /data/service.env
+      OUTPUT_ROOT: /data/deliverables
+      QT_QPA_PLATFORM: offscreen
+      # CPU-only pipeline: no GPU switches are passed and CUDA_VISIBLE_DEVICES is
+      # cleared for every subprocess, so no NVIDIA runtime is required.
+      OPENMVS_DENSIFY_ARGS: '"{scene_mvs}" -o "{dense_mvs}" --resolution-level 2 --max-resolution 1600 --number-views 4 --sub-resolution-levels 0 --fusion-mode 0'
+      # Matching strategy dominates total runtime. sequential matches each image
+      # against its neighbours along the flight line, which suits aerial surveys
+      # and avoids the O(n^2) all-pairs search (428 images: ~4.3k vs ~91k pairs).
+      COLMAP_MATCHER: sequential
+      COLMAP_MATCHER_OVERLAP: "10"
+      # 0 = auto: one worker per available CPU minus one, capped at 16.
+      # Lower it if the container is killed for exceeding mem_limit.
+      PIPELINE_THREADS: "0"
+      SIFT_MAX_IMAGE_SIZE: "3200"
+      MAX_UPLOAD_GB: "50"
+      PIPELINE_MODE: native
+      COMMAND_TIMEOUT_HOURS: "24"
+    volumes:
+      - ./runtime:/data
+      # Optional read-only host data mount for the "挂载目录" input mode.
+      - ./input:/mnt/input:ro
+    restart: unless-stopped
