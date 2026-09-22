@@ -339,8 +339,8 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
 | `GET /api/plans` | 查询持久化生产计划 |
 | `POST /api/plans` | 创建计划，字段：`name`、`upload_id` 或 `input_path`、可选 `scheduled_at`、`start_now` |
 | `POST /api/plans/:id/run` | 开始重建该计划 |
-| `DELETE /api/plans/:id` | 删除单个计划及其全部产物 |
-| `DELETE /api/plans` | 批量删除，JSON：`{"ids": ["...", "..."]}` |
+| `DELETE /api/plans/:id` | 删除单个计划及其全部产物；该计划不存在时返回 404 |
+| `DELETE /api/plans` | 批量删除，JSON：`{"ids": ["...", "..."]}`；幂等，已不存在的 id 不算失败 |
 
 ### 删除计划
 
@@ -358,7 +358,14 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
 - **共用影像不会被误删。** 若同一批上传影像被另一个仍然存在的计划引用，该上传目录会被保留（响应中的 `upload_retained` 会说明），只有删除最后一个引用它的计划时才真正删除。
 - **运行中的计划不允许删除。** 子进程仍持有 `jobs/<任务ID>/` 下的文件，此时删除会破坏运行。请先「停止任务」再删除；接口会返回 409 并说明原因。
 
-批量删除是**部分成功**语义：能删的都删掉，失败的逐个报告，而不是整批回滚。单计划删除返回 200，全部失败返回 404/409，部分失败返回 207。
+批量删除是**幂等**的：删除一个已经不存在（或已被他人删除）的计划不算失败，而是成功——结果里会把它列在 `missing` 中。只有"计划存在但此刻不能删"才算失败。
+
+| 状态码 | 含义 |
+|---|---|
+| `200` | 至少删除了一个；或请求的 id 全部已不存在 |
+| `207` | 部分删除成功、部分被拒绝；body 同时给出 `deleted` 与 `failed` |
+| `409` | 一个都没删掉，因为计划正在运行 |
+| `404` | 仅当用 `DELETE /api/plans/:id` 点名某一个计划且它不存在时 |
 
 响应示例：
 
@@ -369,6 +376,7 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
       "upload_deleted": "upload-...", "deliverables_deleted": true,
       "freed_bytes": 1837465920 }
   ],
+  "missing": ["已不存在的计划ID"],
   "failed": { "某个计划ID": "plan \"...\" still has a running job (...)" },
   "total": 2,
   "succeeded": 1

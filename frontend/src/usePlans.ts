@@ -114,9 +114,17 @@ export function usePlans(hooks: Hooks) {
       const result = await api.deletePlans(ids)
       const freed = result.deleted.reduce((sum, item) => sum + (item.freed_bytes || 0), 0)
       const failures = Object.values(result.failed ?? {})
-      deleteNotice.value = failures.length
-        ? `已删除 ${result.succeeded} 个，释放 ${hooks.formatBytes(freed)}；${failures.length} 个失败：${failures.join('；')}`
-        : `已删除 ${result.succeeded} 个计划，释放 ${hooks.formatBytes(freed)}`
+      const missing = result.missing?.length ?? 0
+
+      // Compose a single sentence covering all four outcomes: removed, already
+      // gone, refused, and how much space came back.
+      const parts: string[] = []
+      if (result.deleted.length) parts.push(`已删除 ${result.deleted.length} 个计划，释放 ${hooks.formatBytes(freed)}`)
+      if (missing) parts.push(`${missing} 个此前已被删除`)
+      if (failures.length) parts.push(`${failures.length} 个失败：${failures.join('；')}`)
+      if (!parts.length) parts.push('没有需要删除的计划')
+
+      deleteNotice.value = parts.join('；')
       clearCheckedPlans()
       hooks.onPlansDeleted(ids)
     } catch (error) {

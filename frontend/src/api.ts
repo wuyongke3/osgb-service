@@ -27,7 +27,12 @@ export async function request<T>(url: string, options?: RequestInit): Promise<T>
     // A non-JSON body (a proxy error page, for instance) is reported below
     // rather than surfacing as a parse failure.
   }
-  if (!response.ok) {
+  // 207 Multi-Status is a success for our purposes: a batch delete reports which
+  // entries were removed and which were refused in the body, and the caller
+  // needs that detail. Treating it as an error discarded the per-plan results
+  // and showed a bare "request failed" instead.
+  const ok = response.ok || response.status === 207
+  if (!ok) {
     const payload = data as { detail?: string; code?: string } | null
     throw new ApiError(payload?.detail || '请求失败', payload?.code || '')
   }

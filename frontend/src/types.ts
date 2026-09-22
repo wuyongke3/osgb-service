@@ -74,6 +74,8 @@ export type ServiceConfig = {
 }
 
 // Outcome of a plan deletion, as returned by DELETE /api/plans.
+// `missing` lists ids that were already absent; that is not a failure, so a
+// repeat delete reports success rather than an error.
 export type DeleteResult = {
   deleted: {
     plan_id: string
@@ -85,6 +87,7 @@ export type DeleteResult = {
     freed_bytes: number
     warnings?: string[]
   }[]
+  missing?: string[]
   failed: Record<string, string>
   total: number
   succeeded: number

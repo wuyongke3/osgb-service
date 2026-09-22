@@ -290,6 +290,36 @@ func TestHandleDeletePlansSingle(t *testing.T) {
 	}
 }
 
+// Deleting a plan that is already gone must succeed, not fail. A repeat click,
+// or a batch whose entries another operator just removed, is a normal race and
+// reporting it as an error made the feature look broken.
+func TestHandleDeletePlansMissingPlanIsNotAnError(t *testing.T) {
+	manager, _ := newDeleteTestManager(t)
+	body := strings.NewReader(`{"ids":["already-gone"]}`)
+	request := httptest.NewRequest(http.MethodDelete, "/api/plans", body)
+	recorder := httptest.NewRecorder()
+	manager.handlePlans(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for an absent plan; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Missing []string          `json:"missing"`
+		Failed  map[string]string `json:"failed"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Missing) != 1 || response.Missing[0] != "already-gone" {
+		t.Errorf("missing = %v, want [already-gone]", response.Missing)
+	}
+	if len(response.Failed) != 0 {
+		t.Errorf("failed = %v, want empty for an absent plan", response.Failed)
+	}
+}
+
+// A single addressed plan that does not exist is the one case where 404 is the
+// useful answer, because the caller named a specific resource.
 func TestHandleDeletePlansUnknownSingleIs404(t *testing.T) {
 	manager, _ := newDeleteTestManager(t)
 	request := httptest.NewRequest(http.MethodDelete, "/api/plans/missing", nil)
@@ -331,9 +361,10 @@ func TestHandleDeletePlansBatch(t *testing.T) {
 	}
 }
 
-// A mixed batch must delete what it can and report the rest, rather than
-// failing the whole request.
-func TestHandleDeletePlansBatchPartial(t *testing.T) {
+// A batch that mixes a deletable plan with an already-absent one must delete
+// what it can and report the rest. Because the absent entry is not an error, the
+// overall result is a success and the client can read both lists from the body.
+func TestHandleDeletePlansBatchWithMissingEntry(t *testing.T) {
 	manager, dataDir := newDeleteTestManager(t)
 	goodID, goodPaths := seedPlan(t, manager, dataDir, "good", "upload-good")
 
@@ -342,20 +373,68 @@ func TestHandleDeletePlansBatchPartial(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	manager.handlePlans(recorder, request)
 
-	if recorder.Code != http.StatusMultiStatus {
-		t.Fatalf("status = %d, want 207; body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	if pathExists(goodPaths["deliverable"]) {
-		t.Error("the valid plan was not deleted in a partial batch")
+		t.Error("the valid plan was not deleted when another entry was absent")
 	}
 	var response struct {
-		Failed map[string]string `json:"failed"`
+		Succeeded int               `json:"succeeded"`
+		Missing   []string          `json:"missing"`
+		Failed    map[string]string `json:"failed"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Failed) != 1 {
-		t.Errorf("failed = %v, want one entry", response.Failed)
+	if response.Succeeded != 1 {
+		t.Errorf("succeeded = %d, want 1", response.Succeeded)
+	}
+	if len(response.Missing) != 1 {
+		t.Errorf("missing = %v, want one entry", response.Missing)
+	}
+	if len(response.Failed) != 0 {
+		t.Errorf("failed = %v, want none", response.Failed)
+	}
+}
+
+// A batch that mixes a deletable plan with a blocked one is a genuine partial
+// success and must answer 207 so the client can separate the two lists.
+func TestHandleDeletePlansBatchPartialBlocked(t *testing.T) {
+	manager, dataDir := newDeleteTestManager(t)
+
+	// One plan with a running job, one free to delete.
+	busyID, busyPaths := seedPlan(t, manager, dataDir, "busy", "upload-busy")
+	for _, job := range manager.snapshots() {
+		if job.PlanID == busyID {
+			manager.update(job.ID, func(j *Job) { j.Status = "running" })
+		}
+	}
+	freeID, freePaths := seedPlan(t, manager, dataDir, "free", "upload-free")
+
+	body := strings.NewReader(`{"ids":["` + busyID + `","` + freeID + `"]}`)
+	request := httptest.NewRequest(http.MethodDelete, "/api/plans", body)
+	recorder := httptest.NewRecorder()
+	manager.handlePlans(recorder, request)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !pathExists(busyPaths["job"]) {
+		t.Error("a running plan's workspace was removed")
+	}
+	if pathExists(freePaths["deliverable"]) {
+		t.Error("the deletable plan was not removed")
+	}
+	var response struct {
+		Succeeded int               `json:"succeeded"`
+		Failed    map[string]string `json:"failed"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Succeeded != 1 || len(response.Failed) != 1 {
+		t.Errorf("succeeded=%d failed=%v, want 1 and one failure", response.Succeeded, response.Failed)
 	}
 }
 

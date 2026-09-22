@@ -201,8 +201,13 @@ func (m *JobManager) handleDeletePlans(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
+	// addressedByPath records whether the caller named one plan in the URL, as
+	// opposed to listing ids in a body. Only the former can meaningfully answer
+	// 404, because it explicitly asked about that one resource.
+	addressedByPath := planID != ""
+
 	ids := []string{}
-	if planID != "" {
+	if addressedByPath {
 		ids = append(ids, planID)
 	} else {
 		var request struct {
@@ -225,38 +230,51 @@ func (m *JobManager) handleDeletePlans(w http.ResponseWriter, r *http.Request, p
 
 	results := make([]*deletePlanOutcome, 0, len(ids))
 	failures := make(map[string]string)
+	missing := make([]string, 0)
+	blocked := false
 	for _, id := range ids {
 		outcome, err := m.deletePlan(id)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				failures[id] = "plan not found"
-			} else {
-				failures[id] = err.Error()
+				// Deleting something already gone is a success for the caller's
+				// intent. It is reported separately rather than as a failure:
+				// returning an error here made a repeat click, or a batch whose
+				// entries another operator had just removed, look broken.
+				missing = append(missing, id)
+				continue
 			}
+			// Anything else means the plan exists but must not be removed right
+			// now, typically because a job is still running.
+			failures[id] = err.Error()
+			blocked = true
 			continue
 		}
+		// Only a real deletion contributes an outcome; appending on the error
+		// paths would put a nil entry in the response's "deleted" array.
 		results = append(results, outcome)
 	}
 
+	// Status codes are chosen so that a client can read the body in every case:
+	//  200 - at least one plan removed, or every requested id was already absent
+	//  207 - some removed, some blocked (the body carries both lists)
+	//  409 - nothing removed because a plan is in use
+	//  404 - only when a single plan was addressed by path and it does not
+	//        exist, which is the one situation where naming a missing resource
+	//        is the useful answer. A batch body listing absent ids is not an
+	//        error: the caller asked to make them gone and they are gone.
 	status := http.StatusOK
 	switch {
-	case len(results) == 0:
-		// Nothing was deleted. A single unknown id is a 404; a mixed batch where
-		// every entry failed is a conflict, since the usual cause is a running
-		// job rather than a missing plan.
+	case len(results) == 0 && blocked:
+		status = http.StatusConflict
+	case len(results) == 0 && addressedByPath && len(missing) == 1:
 		status = http.StatusNotFound
-		for _, message := range failures {
-			if message != "plan not found" {
-				status = http.StatusConflict
-				break
-			}
-		}
 	case len(failures) > 0:
 		status = http.StatusMultiStatus
 	}
 
 	writeJSON(w, status, map[string]any{
 		"deleted":   results,
+		"missing":   missing,
 		"failed":    failures,
 		"total":     len(ids),
 		"succeeded": len(results),
