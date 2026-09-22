@@ -658,4 +658,70 @@ OSGB-SERVICE 重构与优化跟踪文档
   待服务器复核: 用真实 428 张航飞数据实测匹配阶段提速倍数。
                 当前"减少 95% 图像对"是基于计数的事实,
                 但"5.7h -> 0.3~0.6h"的端到端时间是推算, 非实测。
+
+
+第 6 节  提交与部署记录
+================================================================================
+
+提交 (2026-02-12):
+  仓库    https://github.com/wuyongke3/osgb-service.git
+  分支    master (跟踪 origin/master)
+  提交    ccb0104 "Fix pipeline correctness issues; default to CPU-only
+          sequential matching"
+  内容    29 个文件, 9708 行新增
+  说明    推之前确认远程为空(git ls-remote 无任何 ref), 属安全的首个提交,
+          未覆盖既有内容。
+
+  入库前处理: 新增 .gitignore, 排除以下不应进版本库的内容
+    runtime/                 21.4 GB (uploads 19.8 GB + jobs 1.6 GB)
+                             —— 航飞原始影像与 COLMAP/OpenMVS 中间产物
+    frontend/node_modules/   61 MB 第三方依赖
+    .env                     含本机绝对路径(E:/colmap-x64-windows-cuda/...);
+                             模板 .env.example 已入库
+    web/                     Vite 构建产物, Dockerfile 第 6 行会自行构建
+    *.tsbuildinfo, vite.config.js/.d.ts  前端生成的中间文件
+    *.osgb/*.ply/*.mvs/*.db/*.zip         管线产物(防止 git add -A 误收 GB 级文件)
+  结果: 仅 0.35 MB 源码入库, 并已确认 build 与 test 在不含 web/ 时仍通过。
+
+容器重建 (2026-02-12):
+  1. 清理遗留容器 focused_williamson
+     该容器是此前 `docker run --rm ... colmap --help` 探测时残留的孤儿:
+     带 compose 标签但使用匿名卷。先确认其匿名卷内 jobs/uploads/plans/
+     deliverables 四个目录全为空(创建时间 06:56, 与探测时刻吻合), 且未
+     映射任何端口, 确认无数据价值后才删除。
+  2. docker compose build  -> 镜像 osgb-service:latest 重建成功
+     注意: 构建日志大量显示 CACHED(server-build 层也被复用), 原因是先前
+     用同一份源码构建过 osgb-service:cpu-opt。因此不能凭 "CACHED" 断定
+     镜像陈旧, 改用功能性验证(见下)。
+  3. docker compose up -d --force-recreate -> 容器已重建并 running
+
+  重建后验证 (全部通过):
+    - 容器状态         Up (healthy), 端口 0.0.0.0:8080->8080
+    - /health          {"go":"go1.26.8","status":"ok"}
+    - 数据保留         jobs=9, plans=6 (数据在 host bind mount ./runtime,
+                       重建容器不丢失)
+    - 依赖检测         colmap/osgconv/InterfaceCOLMAP/DensifyPointCloud/
+                       ReconstructMesh/RefineMesh/TextureMesh 全部 true,
+                       native_pipeline_ready=True
+    - 新配置生效       COLMAP_MATCHER=sequential, COLMAP_MATCHER_OVERLAP=10,
+                       PIPELINE_THREADS=0, SIFT_MAX_IMAGE_SIZE=3200
+    - 纯 CPU 确认      OPENMVS_DENSIFY_ARGS 不含 cuda/gpu 参数;
+                       DeviceRequests=[](未申请任何 GPU 设备), Runtime=runc
+    - COLMAP 版本      3.9.1 (without CUDA), 已写入 /opt/colmap-version.txt
+    - 容器可见核数     32 (PIPELINE_THREADS=0 时自动推导为 16)
+    - 功能实测         在重建后的镜像上提交真实任务, 服务实际生成的命令为:
+                         CPU-only: ... threads=16
+                         matcher=sequential_matcher overlap=10,
+                           candidate image pairs=80
+                         colmap feature_extractor ... --SiftExtraction.use_gpu 0
+                           --SiftExtraction.num_threads 16
+                           --SiftExtraction.max_image_size 3200
+                         colmap sequential_matcher ... --SiftMatching.use_gpu 0
+                           --SiftMatching.num_threads 16
+                           --SequentialMatching.overlap 10
+                       即: 自动选中 legacy 拼写(适配 3.9.1)、GPU 全关、
+                       线程 16、sequential 匹配 —— 新逻辑全部生效。
+
+  遗留说明: 镜像内服务为 /app/osgb-service, web 前端由 Dockerfile 的
+            web-build 阶段生成, 与 .gitignore 排除 web/ 不冲突。
 ================================================================================
