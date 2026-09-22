@@ -12,6 +12,8 @@ type Hooks = {
   onPlansDeleted: (ids: string[]) => void
   runningPlanIds: () => Set<string>
   formatBytes: (bytes?: number) => string
+  // upload reads the completed upload from useService, which owns it.
+  upload: () => Upload | null
 }
 
 export function usePlans(hooks: Hooks) {
@@ -20,7 +22,6 @@ export function usePlans(hooks: Hooks) {
   const scheduledAt = ref('')
   const sourceMode = ref<'upload' | 'path'>('upload')
   const inputPath = ref('')
-  const upload = ref<Upload | null>(null)
   const isCreating = ref(false)
 
   // Selection for deletion, kept as a Set of ids so it survives a list refresh.
@@ -36,8 +37,13 @@ export function usePlans(hooks: Hooks) {
   const allSelected = computed(() => selectablePlans.value.length > 0 && checkedCount.value === selectablePlans.value.length)
   const someSelected = computed(() => checkedCount.value > 0 && checkedCount.value < selectablePlans.value.length)
   const canDeleteChecked = computed(() => checkedCount.value > 0 && !isDeleting.value)
+
+  // The uploaded image set lives in useService, which performs the upload. It is
+  // read through hooks.upload rather than a local ref: a second copy here would
+  // never be written, leaving canCreate permanently false and the "立即重建
+  // OSGB" button disabled no matter what the operator uploaded.
   const canCreate = computed(() => Boolean(planName.value.trim())
-    && (sourceMode.value === 'upload' ? Boolean(upload.value) : Boolean(inputPath.value.trim()))
+    && (sourceMode.value === 'upload' ? Boolean(hooks.upload()) : Boolean(inputPath.value.trim()))
     && !isCreating.value)
 
   // Selecting a plan only selects it. Starting is a deliberate second action
@@ -67,7 +73,7 @@ export function usePlans(hooks: Hooks) {
     isCreating.value = true
     try {
       const body: Record<string, unknown> = { name: planName.value.trim(), start_now: startNow }
-      if (sourceMode.value === 'upload') body.upload_id = upload.value?.id
+      if (sourceMode.value === 'upload') body.upload_id = hooks.upload()?.id
       else body.input_path = inputPath.value.trim()
       if (!startNow && scheduledAt.value) body.scheduled_at = new Date(scheduledAt.value).toISOString()
 
@@ -135,7 +141,7 @@ export function usePlans(hooks: Hooks) {
   }
 
   return {
-    plans, planName, scheduledAt, sourceMode, inputPath, upload, isCreating,
+    plans, planName, scheduledAt, sourceMode, inputPath, isCreating,
     checkedPlanIds, selectedPlanId, isDeleting, deleteNotice,
     checkedCount, selectablePlans, allSelected, someSelected, canDeleteChecked, canCreate,
     selectPlan, togglePlanCheck, clearCheckedPlans, toggleCheckAll,

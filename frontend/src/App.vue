@@ -37,6 +37,8 @@ const planStore = usePlans({
     if (ids.includes(planStore.selectedPlanId.value)) planStore.selectedPlanId.value = ''
   },
   runningPlanIds: () => jobStore.runningPlanIds.value,
+  // The uploaded image set belongs to useService; usePlans only reads it.
+  upload: () => service.upload.value,
   formatBytes,
 })
 
