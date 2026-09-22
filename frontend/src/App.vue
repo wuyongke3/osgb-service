@@ -1,173 +1,93 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+// App.vue is the view. State and behaviour live in the composables so each
+// concern can be read on its own:
+//   useService.ts  service configuration, tool paths, image upload
+//   usePlans.ts    production plans: create, select, run, delete
+//   useJobs.ts     job list, live monitor (SSE), cancel/resume/download
+//   api.ts         every HTTP call
+//   types.ts       wire shapes; format.ts display helpers
 
-type LogEntry = { at: string; stream: string; message: string }
-type Job = {
-  id: string; status: 'queued' | 'running' | 'completed' | 'failed'; phase: string; progress: number
-  created_at: string; updated_at: string; input_path: string; output_path: string; input_count: number
-  input_bytes: number; plan_id?: string; source_type?: string; error?: string; logs: LogEntry[]
-  checkpoint?: string; resumable?: boolean
-  stats?: { vertices: number; faces: number; tiles?: number; valid_tiles?: number; failed_tiles?: number; textured?: boolean }
-}
-type Plan = { id: string; name: string; upload_id?: string; input_path?: string; status: string; scheduled_at?: string; created_at: string; updated_at: string; last_job_id?: string }
-type Upload = { id: string; path: string; files: number; bytes: number; created_at: string }
-type ToolPath = { key: string; label: string; value: string; available: boolean; required: boolean }
-type ServiceConfig = { native_pipeline_ready: boolean; dependencies: Record<string, boolean>; pipeline_mode: string; output_root: string; config_file: string; native_directory_picker: boolean; tool_paths: ToolPath[]; deployment?: { kind: string; tool_install_mode: string; tool_install_command: string; automatic: boolean; can_execute_here: boolean; note: string } }
+import { onMounted, ref } from 'vue'
+import { api, errorText } from './api'
+import { useJobs } from './useJobs'
+import { usePlans } from './usePlans'
+import { useService } from './useService'
+import type { Job, Plan } from './types'
+import { PHASES, formatBytes, phaseIndex, phaseLabel, statusText } from './format'
 
-const config = ref<ServiceConfig | null>(null)
-const plans = ref<Plan[]>([])
-const jobs = ref<Job[]>([])
-const job = ref<Job | null>(null)
-const sourceMode = ref<'upload' | 'path'>('upload')
-const selectedFiles = ref<File[]>([])
-const inputPath = ref('')
-const upload = ref<Upload | null>(null)
-const planName = ref('')
-const scheduledAt = ref('')
 const errorMessage = ref('')
-const isUploading = ref(false)
-const isCreating = ref(false)
-const isSavingTools = ref(false)
-const showToolSettings = ref(false)
-const toolDraft = ref<Record<string, string>>({})
-const installCommandCopied = ref(false)
-// Plans ticked in the left list. Selection is kept as a Set of ids so it
-// survives the list being refreshed after a delete.
-const checkedPlanIds = ref<Set<string>>(new Set())
-const selectedPlanId = ref('')
-const isDeleting = ref(false)
-const deleteNotice = ref('')
-let eventSource: EventSource | null = null
 
-const phases = [
-  ['preparing', '影像预处理'], ['features', '特征提取'], ['matching', '特征匹配'], ['sfm', '空三 / 束调'],
-  ['dense', '稠密点云'], ['mesh', '网格重建'], ['texture', '纹理映射'], ['georeference', '坐标检查'],
-  ['lod', 'Smart3D 分层 OSGB'], ['osgb_conversion', 'OSGB 转换与校验'], ['completed', '完成'],
-] as const
-
-const isRunning = computed(() => job.value?.status === 'queued' || job.value?.status === 'running')
-const ready = computed(() => Boolean(config.value?.native_pipeline_ready))
-const canUpload = computed(() => selectedFiles.value.length > 0 && !isUploading.value)
-const canCreate = computed(() => Boolean(planName.value.trim()) && (sourceMode.value === 'upload' ? Boolean(upload.value) : Boolean(inputPath.value.trim())) && !isCreating.value)
-function phaseIndex(phase?: string) { const i = phases.findIndex(([key]) => key === phase); return i < 0 ? 0 : i }
-function formatBytes(bytes = 0) { return bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024 ** 3).toFixed(2)} GB` }
-function statusText(status?: string) { return ({ queued: '排队中', running: '处理中', completed: '已完成', failed: '失败', scheduled: '已预约', draft: '草稿' } as Record<string, string>)[status ?? ''] ?? '待处理' }
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options); const data = await response.json()
-  if (!response.ok) throw new Error(data.detail || '请求失败'); return data as T
+function reportError(message: string) {
+  errorMessage.value = message
 }
+
+const service = useService(reportError)
+
+// Created before usePlans because the plan list needs to know which plans are
+// busy, so that a running plan cannot be selected for deletion.
+const jobStore = useJobs(reportError)
+
+const planStore = usePlans({
+  onError: reportError,
+  onJobStarted: (job: Job) => jobStore.selectJob(job),
+  onPlansDeleted: (ids: string[]) => {
+    // If the plan that owns the selected job is gone, drop the monitor too.
+    const selected = jobStore.job.value
+    if (selected?.plan_id && ids.includes(selected.plan_id)) jobStore.clearSelection()
+    if (ids.includes(planStore.selectedPlanId.value)) planStore.selectedPlanId.value = ''
+  },
+  runningPlanIds: () => jobStore.runningPlanIds.value,
+  formatBytes,
+})
+
 async function refresh() {
   try {
-    const [service, planResponse, jobResponse] = await Promise.all([request<ServiceConfig>('/api/config'), request<{ plans: Plan[] }>('/api/plans'), request<{ jobs: Job[] }>('/api/jobs')])
-    config.value = service; toolDraft.value = Object.fromEntries(service.tool_paths.map(tool => [tool.key, tool.value])); plans.value = planResponse.plans; jobs.value = jobResponse.jobs
-    if (!job.value && jobs.value.length) selectJob(jobs.value[0])
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '无法连接服务' }
-}
-async function saveToolPaths() {
-  if (!config.value) return
-  isSavingTools.value = true; errorMessage.value = ''
-  try {
-    config.value = await request<ServiceConfig>('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tools: toolDraft.value }) })
-    toolDraft.value = Object.fromEntries(config.value.tool_paths.map(tool => [tool.key, tool.value]))
-    showToolSettings.value = false
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '工具配置保存失败' } finally { isSavingTools.value = false }
-}
-function chooseFiles(event: Event) { selectedFiles.value = Array.from((event.target as HTMLInputElement).files ?? []); upload.value = null }
-async function uploadFiles() {
-  if (!canUpload.value) return; isUploading.value = true; errorMessage.value = ''
-  try { const form = new FormData(); for (const file of selectedFiles.value) form.append('files', file, file.webkitRelativePath || file.name); upload.value = await request<Upload>('/api/uploads', { method: 'POST', body: form }) }
-  catch (error) { errorMessage.value = error instanceof Error ? error.message : '上传失败' } finally { isUploading.value = false }
-}
-async function createPlan(startNow: boolean) {
-  if (!canCreate.value) return; isCreating.value = true; errorMessage.value = ''
-  try {
-    const body: Record<string, unknown> = { name: planName.value.trim(), start_now: startNow }
-    if (sourceMode.value === 'upload') body.upload_id = upload.value?.id; else body.input_path = inputPath.value.trim()
-    if (!startNow && scheduledAt.value) body.scheduled_at = new Date(scheduledAt.value).toISOString()
-    const result = await request<Plan | { plan: Plan; job: Job }>('/api/plans', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    if ('job' in result) { selectJob(result.job); plans.value = [result.plan, ...plans.value.filter(item => item.id !== result.plan.id)] } else plans.value = [result, ...plans.value]
-    planName.value = ''; scheduledAt.value = ''
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '创建计划失败' } finally { isCreating.value = false }
-}
-async function runPlan(plan: Plan) { try { selectJob(await request<Job>(`/api/plans/${encodeURIComponent(plan.id)}/run`, { method: 'POST' })); await refresh() } catch (error) { errorMessage.value = error instanceof Error ? error.message : '启动计划失败' } }
-
-// Plans are selected, not started, when clicked. Starting is a deliberate
-// second click because a run occupies the pipeline for hours.
-function selectPlan(plan: Plan) { selectedPlanId.value = plan.id; errorMessage.value = ''; deleteNotice.value = '' }
-function togglePlanCheck(planId: string, checked: boolean) {
-  const next = new Set(checkedPlanIds.value)
-  if (checked) next.add(planId); else next.delete(planId)
-  checkedPlanIds.value = next
-}
-function clearCheckedPlans() { checkedPlanIds.value = new Set() }
-const checkedCount = computed(() => checkedPlanIds.value.size)
-// A plan can be deleted unless one of its jobs is running: deleting the
-// workspace out from under a live subprocess would corrupt the run.
-const runningPlanIds = computed(() => new Set(jobs.value.filter(item => item.status === 'running' || item.status === 'queued').map(item => item.plan_id).filter((id): id is string => Boolean(id))))
-const selectablePlans = computed(() => plans.value.filter(plan => !runningPlanIds.value.has(plan.id)))
-const canDeleteChecked = computed(() => checkedCount.value > 0 && !isDeleting.value)
-
-function toggleCheckAll(checked: boolean) {
-  checkedPlanIds.value = checked ? new Set(selectablePlans.value.map(plan => plan.id)) : new Set()
-}
-
-async function deleteCheckedPlans() {
-  const ids = [...checkedPlanIds.value]
-  if (!ids.length || isDeleting.value) return
-  const names = plans.value.filter(plan => checkedPlanIds.value.has(plan.id)).map(plan => plan.name)
-  const confirmed = window.confirm(
-    `确定删除以下 ${ids.length} 个计划吗？\n\n${names.join('\n')}\n\n` +
-    '这会同时删除它们的成果包、任务临时产物和已上传的影像，且无法恢复。'
-  )
-  if (!confirmed) return
-  await deletePlans(ids)
-}
-
-async function deletePlans(ids: string[]) {
-  isDeleting.value = true; errorMessage.value = ''; deleteNotice.value = ''
-  try {
-    const result = await request<{ deleted: { name: string; freed_bytes: number }[]; failed: Record<string, string>; succeeded: number }>(
-      '/api/plans', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }
-    )
-    const freed = result.deleted.reduce((sum, item) => sum + (item.freed_bytes || 0), 0)
-    const failedNames = Object.keys(result.failed ?? {})
-    if (failedNames.length) {
-      deleteNotice.value = `已删除 ${result.succeeded} 个，释放 ${formatBytes(freed)}；${failedNames.length} 个失败：${Object.values(result.failed).join('；')}`
-    } else {
-      deleteNotice.value = `已删除 ${result.succeeded} 个计划，释放 ${formatBytes(freed)}`
-    }
-    clearCheckedPlans()
-    if (ids.includes(selectedPlanId.value)) { selectedPlanId.value = ''; job.value = null; closeEvents() }
-    await refresh()
+    const [serviceConfig, planResponse, jobResponse] = await Promise.all([
+      api.config(), api.plans(), api.jobs(),
+    ])
+    service.applyConfig(serviceConfig)
+    planStore.plans.value = planResponse.plans
+    jobStore.jobs.value = jobResponse.jobs
+    // Adopt the most recent job on first load so the monitor is not empty.
+    if (!jobStore.job.value && jobResponse.jobs.length) jobStore.selectJob(jobResponse.jobs[0])
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '删除计划失败'
-  } finally { isDeleting.value = false }
+    reportError(errorText(error, '无法连接服务'))
+  }
 }
-async function cancelJob() { if (!job.value) return; try { job.value = await request<Job>(`/api/jobs/${encodeURIComponent(job.value.id)}/cancel`, { method: 'DELETE' }); closeEvents(); await refresh() } catch (error) { errorMessage.value = error instanceof Error ? error.message : '停止失败' } }
-async function resumeJob() {
-  if (!job.value?.resumable) return
-  try { selectJob(await request<Job>(`/api/jobs/${encodeURIComponent(job.value.id)}/resume`, { method: 'POST' })) }
-  catch (error) { errorMessage.value = error instanceof Error ? error.message : '恢复任务失败' }
-}
-function selectJob(next: Job) { job.value = next; connectEvents(next.id) }
-function connectEvents(id: string) {
-  closeEvents(); eventSource = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events`)
-  const update = (event: Event) => { try { job.value = JSON.parse((event as MessageEvent<string>).data) as Job; if (job.value.status === 'completed' || job.value.status === 'failed') { closeEvents(); refresh() } } catch { errorMessage.value = '实时日志数据异常' } }
-  eventSource.addEventListener('snapshot', update); eventSource.addEventListener('update', update)
-}
-function closeEvents() { eventSource?.close(); eventSource = null }
-function download() { if (job.value?.status === 'completed') window.location.assign(`/api/jobs/${encodeURIComponent(job.value.id)}/download`) }
-async function copyInstallCommand() {
-  const command = config.value?.deployment?.tool_install_command
-  if (!command) return
+
+async function runPlan(plan: Plan) {
+  await planStore.runPlan(plan)
   try {
-    await navigator.clipboard.writeText(command)
-    installCommandCopied.value = true
-    window.setTimeout(() => { installCommandCopied.value = false }, 1800)
-  } catch { errorMessage.value = '无法复制命令，请手动选择复制' }
+    await jobStore.refreshJobs()
+  } catch (error) {
+    reportError(errorText(error, '刷新任务列表失败'))
+  }
 }
-onMounted(refresh); onBeforeUnmount(closeEvents)
+
+// The template reads these names directly. Destructuring keeps the markup flat
+// rather than prefixing every reference with its composable, which would make
+// the template harder to scan than the original single-file version.
+const {
+  config, toolDraft, showToolSettings, isSavingTools, installCommandCopied,
+  selectedFiles, upload, isUploading, ready, canUpload,
+  saveToolPaths, chooseFiles, uploadFiles, copyInstallCommand,
+} = service
+
+const {
+  plans, planName, scheduledAt, sourceMode, inputPath, isCreating,
+  checkedPlanIds, selectedPlanId, isDeleting, deleteNotice,
+  checkedCount, selectablePlans, allSelected, canDeleteChecked, canCreate,
+  selectPlan, togglePlanCheck, toggleCheckAll, createPlan, deleteCheckedPlans,
+} = planStore
+
+const { job, isRunning, runningPlanIds, cancelJob, resumeJob, download } = jobStore
+
+// The template iterates the phase list and resolves a phase key to its index.
+const phases = PHASES
+
+onMounted(refresh)
 </script>
+
 
 <template>
   <div class="shell">

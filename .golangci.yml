@@ -113,7 +113,8 @@ issues:
     # reconstruction runs for hours and must survive the browser disconnecting.
     # Cancellation is handled explicitly through the per-command timeout and the
     # cancel registry in JobManager. See the comment on runCommand.
-    - path: cmd/server/main\.go
+    # The callers live in api.go since main.go was split by module.
+    - path: cmd/server/api\.go
       linters:
         - contextcheck
       source: "go m\\.run|m\\.startPlan|m\\.resumeFromDense|m\\.resumeJob"
