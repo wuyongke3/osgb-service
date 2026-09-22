@@ -1,10 +1,212 @@
 # 航飞影像 OSGB 生产服务
 
-本项目是一个可容器化部署的单用户生产服务：Vue 3 + Vite + TypeScript 提供影像上传、生产计划、阶段组态和 SSE 实时日志；Go 服务负责任务目录、进程编排、Smart3D 风格分层 OSGB、metadata 写入、回读校验和成果下载。上传的照片只保存在部署者挂载的 `/data` 卷中。
+可容器化部署的单用户摄影测量服务。浏览器上传航飞影像 → 自动调用 COLMAP / OpenMVS / OpenSceneGraph 重建 → 输出 **Smart3D 风格的分层 PagedLOD OSGB 瓦片树**，可打包下载。
 
-## 标准开源链路（默认）
+- 前端：Vue 3 + Vite + TypeScript（影像上传、生产计划、阶段时间轴、SSE 实时日志）
+- 后端：Go 1.26，**仅标准库，无第三方依赖**（任务目录、进程编排、LOD 分层、回读校验）
+- 计算：**全程 CPU**，不需要 GPU 或 NVIDIA Container Toolkit
 
-`PIPELINE_MODE=native` 时，服务按下列阶段运行：
+---
+
+## 快速开始
+
+**推荐使用 Docker 部署**（本文档以下步骤均已实测验证）。若需在 Windows 本机开发调试，见 [方式二](#方式二本机运行windowslinux-开发调试)。
+
+### 环境要求
+
+| 项目 | 要求 |
+|---|---|
+| 操作系统 | Linux 服务器（推荐）或 Windows + Docker Desktop |
+| Docker | Docker Engine 20.10+ 与 Docker Compose v2 |
+| 内存 | **建议 16 GB 以上**（Compose 默认限制容器 12 GB） |
+| 磁盘 | 影像总量 × 3 倍以上可用空间（中间产物很大） |
+| CPU | 核心越多越快，线程数自动适配 |
+
+> 一次完整重建的中间产物可达数十 GB，例如 428 张 2.76 GB 的影像会产生 800 MB 以上的 `database.db`。请确保数据盘有充足空间。
+
+### 方式一：Docker 部署（推荐）
+
+#### 1. 获取代码
+
+```bash
+git clone https://github.com/wuyongke3/osgb-service.git
+cd osgb-service
+```
+
+#### 2. 创建数据目录
+
+```bash
+mkdir -p runtime input
+```
+
+- `runtime/` —— 持久化目录，存放上传的影像、任务日志、中间产物和交付成果
+- `input/` —— 可选。若影像数据量太大不想用浏览器上传，把宿主机影像目录挂到这里（只读）
+
+#### 3. 准备配置文件（可选）
+
+```bash
+cp .env.example .env
+```
+
+`.env` 用于覆盖默认值，**不改也能直接运行**。常用的几项：
+
+```ini
+OSGB_MEMORY_LIMIT=12g      # 容器内存上限，按服务器实际情况调整
+PIPELINE_THREADS=0         # 0 = 自动（CPU 核数 -1，上限 16）
+COLMAP_MATCHER=sequential  # 匹配策略，sequential 最快，适合航飞影像
+```
+
+#### 4. 构建并启动
+
+**首次构建需要 15–30 分钟**，因为镜像会从源码编译 OpenMVS：
+
+```bash
+docker compose up -d --build
+```
+
+也可使用一键脚本（会校验 Docker 环境并强制重建）：
+
+```bash
+bash ./scripts/install-tools.sh
+```
+
+#### 5. 验证安装
+
+```bash
+# 容器应为 healthy
+docker compose ps
+
+# 健康检查，应返回 {"go":"go1.26.x","status":"ok"}
+curl http://localhost:8080/health
+
+# 确认 7 个外部工具全部就绪
+curl -s http://localhost:8080/api/config | grep -o '"native_pipeline_ready":true'
+```
+
+浏览器打开 **<http://localhost:8080>**，右上角应显示“生产引擎就绪”。
+
+#### 6. 查看日志与排查
+
+```bash
+docker compose logs -f osgb-service                    # 服务日志
+docker compose exec osgb-service cat /opt/colmap-version.txt  # 容器内 COLMAP 版本
+```
+
+若 `native_pipeline_ready` 为 `false`，说明某个工具未安装成功，打开页面右上角“工具配置”可看到具体哪一个未检测到。
+
+#### 常用运维命令
+
+```bash
+docker compose restart              # 重启服务
+docker compose down                 # 停止并删除容器（runtime/ 数据保留）
+docker compose up -d --build        # 代码更新后重建
+docker compose logs -f --tail 100   # 跟踪最近日志
+```
+
+> **数据安全**：所有数据保存在宿主机 `./runtime` 目录，`docker compose down` 不会删除它。升级时重新 `build` 并 `up -d --force-recreate` 即可，任务与计划列表会自动恢复。
+
+### 方式二：本机运行（Windows/Linux 开发调试）
+
+需要自行安装 7 个外部工具：`colmap`、`InterfaceCOLMAP`、`DensifyPointCloud`、`ReconstructMesh`、`RefineMesh`、`TextureMesh`、`osgconv`。
+
+#### 1. 安装 Go 与 Node.js
+
+- Go 1.26 或更高：<https://go.dev/dl/>
+- Node.js 20 或更高：<https://nodejs.org/>
+
+#### 2. 安装外部工具
+
+**Windows：**
+
+- COLMAP：<https://github.com/colmap/colmap/releases>，下载 `colmap-x64-windows-cuda.zip`
+- OpenMVS：<https://github.com/cdcseacave/openMVS/releases>，下载 `OpenMVS_Windows_x64_CUDA.zip`
+- OpenSceneGraph：<https://objexx.com/OpenSceneGraph.html>，下载 `OpenSceneGraph 3.6.5 - VC2022 - 64-bit`
+
+OpenSceneGraph 解压后确认存在 `bin\osgconv.exe`。**不要只复制单个 `osgconv.exe`**，需保留同级 DLL 与 `osgPlugins-*` 目录，否则无法读取纹理。
+
+**Linux：**
+
+```bash
+sudo apt-get install -y colmap openscenegraph
+# OpenMVS 不在 Ubuntu 24.04 的 apt 源中，需自行编译：
+# https://github.com/cdcseacave/openMVS/wiki/Building
+```
+
+#### 3. 配置工具路径
+
+```bash
+cp .env.example .env
+```
+
+在 `.env` 中填写绝对路径（正斜杠、反斜杠均可）：
+
+```ini
+COLMAP_BIN=E:/colmap-x64-windows-cuda/bin/colmap.exe
+OPENMVS_INTERFACE_BIN=E:/OpenMVS_Windows_x64_CUDA/InterfaceCOLMAP.exe
+OPENMVS_DENSIFY_BIN=E:/OpenMVS_Windows_x64_CUDA/DensifyPointCloud.exe
+OPENMVS_RECONSTRUCT_BIN=E:/OpenMVS_Windows_x64_CUDA/ReconstructMesh.exe
+OPENMVS_REFINE_BIN=E:/OpenMVS_Windows_x64_CUDA/RefineMesh.exe
+OPENMVS_TEXTURE_BIN=E:/OpenMVS_Windows_x64_CUDA/TextureMesh.exe
+OSGCONV_BIN=E:/OpenSceneGraph-3.6.5/bin/osgconv.exe
+```
+
+> 含空格的路径请用双引号包裹。注意 `"C:\dir\"` 这种结尾反斜杠紧邻引号的写法存在歧义，请去掉结尾反斜杠或改用正斜杠。
+
+也可以把这些目录加入系统 `PATH`，然后保持默认的命令名即可。
+
+#### 4. 构建前端
+
+Go 服务会直接托管 `web/` 目录，因此**必须先构建前端**：
+
+```bash
+cd frontend
+npm install
+npm run build      # 产物输出到 ../web
+cd ..
+```
+
+#### 5. 启动服务
+
+```bash
+go run ./cmd/server
+```
+
+浏览器打开 <http://localhost:8080>。端口被占用时可在 `.env` 中设置 `PORT=8098` 等其他端口。
+
+#### 6. 运行测试
+
+```bash
+go test -count=1 ./cmd/server/
+```
+
+---
+
+## 使用流程
+
+1. 打开页面，右上角确认显示“生产引擎就绪”
+2. 左侧填写**计划名称**
+3. 选择影像来源（二选一）：
+   - **上传影像** —— 浏览器选择航飞影像文件夹（保留目录结构）
+   - **挂载目录** —— 填写容器内路径，例如 `/mnt/input/site-a/images`
+4. 可选：设置预约执行时间；留空则保存为草稿，之后手动启动
+5. 点击 **立即重建 OSGB**
+6. 右侧查看阶段时间轴与实时日志，完成后点击 **下载 OSGB 成果包**
+
+成果包内容：`root.osgb`、`Data/` 分层瓦片、纹理、`validation_report.json`。
+交付路径为 `/data/deliverables/<计划ID>/<任务ID>/`。
+
+### 两种数据入口
+
+| 入口 | 适用情况 | 容器内位置 |
+|---|---|---|
+| 上传影像 | 操作员从浏览器选择影像文件夹 | 自动保存至 `/data/uploads/...` |
+| 挂载目录 | 数据量很大、不希望经过浏览器上传 | 宿主机目录挂载为 `./input:/mnt/input:ro`，页面填 `/mnt/input/子目录` |
+
+---
+
+## 标准开源链路
+
+`PIPELINE_MODE=native`（默认）时按下列阶段运行：
 
 | 阶段 | 组件 | 产物 |
 |---|---|---|
@@ -16,55 +218,24 @@
 | 纹理映射 | OpenMVS `TextureMesh` | OBJ + 纹理 |
 | OSGB 输出 | OpenSceneGraph `osgconv` + 服务内置分层器 | `root.osgb`、`Data/` PagedLOD 瓦片、纹理、metadata、校验报告 |
 
-该链路不调用 ODX。默认配置为纯 CPU：COLMAP 的特征提取与匹配关闭 GPU，OpenMVS 稠密重建不传递 CUDA 设备参数，且所有子进程都会清空 `CUDA_VISIBLE_DEVICES`，因此 Docker/Linux 部署不需要 NVIDIA Container Toolkit。CPU 重建速度会明显慢于经过验证的 CUDA 环境，可通过 `COLMAP_MATCHER` 与 `PIPELINE_THREADS` 调优，详见下文“性能与纯 CPU 计算”。
+该链路不调用 ODX。
 
-## 安装依赖
-
-需要将以下程序放入 `PATH`，或在 `.env` 中填写绝对路径：`colmap`、`InterfaceCOLMAP`、`DensifyPointCloud`、`ReconstructMesh`、`RefineMesh`、`TextureMesh`、`osgconv`。
-
-### Windows OpenSceneGraph 下载
-
-OpenSceneGraph 官方稳定版页面列出的 Windows 64 位构建来自 Objexx Engineering：
-
-<https://objexx.com/OpenSceneGraph.html>
-
-当前可用包为 `OpenSceneGraph 3.6.5 - VC2022 - 64-bit`。下载 `.7z` 后用 7-Zip 解压，例如 `E:\OpenSceneGraph-3.6.5`，确认其中存在 `bin\osgconv.exe`。然后在 `.env` 中填写：
-
-```text
-OSGCONV_BIN=E:/OpenSceneGraph-3.6.5/bin/osgconv.exe
-```
-
-也可以把该 `bin` 目录加入系统 `PATH`，再保持 `OSGCONV_BIN=osgconv`。运行时需保留压缩包解压出的 DLL 和 `osgPlugins-*` 目录，不要只复制单个 `osgconv.exe`。
-
-复制 `.env.example` 为 `.env` 后，可通过 `GET /api/config` 查看每个依赖是否可执行。标准链路会将贴图 OBJ 转为 Smart3D 风格的 PagedLOD OSGB 树：`root.osgb`、`Data/` 分层瓦片与纹理；每个瓦片和根节点均写入 OSG `UserDataContainer` metadata，并在完成时用 `osgconv` 回读检查层级、贴图、几何和 metadata。
-
-## 启动
-
-```powershell
-Set-Location osgb-service
-Copy-Item .env.example .env
-Set-Location frontend
-npm install
-npm run build
-Set-Location ..
-go run ./cmd/server
-```
-
-浏览器打开 `http://localhost:8080`。端口被占用时设置 `PORT=8098` 等其他端口。
+---
 
 ## 配置
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `PORT` | `8080` | 服务监听端口 |
 | `PIPELINE_MODE` | `native` | `native` 使用 COLMAP/OpenMVS；`external` 使用兼容旧流程的 `RECON_BIN` + `OSGB_BIN` |
-| `DATA_DIR` | `./runtime` | 每个任务的中间文件和日志目录 |
+| `DATA_DIR` | `./runtime` | 每个任务的中间文件和日志目录；Docker 为 `/data` |
 | `CONFIG_FILE` | `runtime/service.env` | Web“工具配置”保存的持久化工具路径文件；Docker 为 `/data/service.env` |
 | `COLMAP_BIN` | `colmap` | COLMAP 可执行文件 |
 | `OPENMVS_*_BIN` | 对应命令名 | OpenMVS 六个阶段的可执行文件 |
 | `OSGCONV_BIN` | `osgconv` | OBJ 到 OSGB 的转换器 |
 | `GEOREF_BIN` / `GEOREF_ARGS` | 空 | 可选坐标转换/GCP 校正阶段 |
 | `LOD_BIN` / `LOD_ARGS` | 空 | 可选的第三方 LOD 前处理；最终仍由服务生成 Smart3D 分层树 |
-| `OUTPUT_ROOT` | 空 | 设置后限制输出路径必须位于该目录内 |
+| `OUTPUT_ROOT` | 空 | 设置后限制输出路径必须位于该目录内；Docker 为 `/data/deliverables` |
 | `COMMAND_TIMEOUT_HOURS` | `24` | 单个外部命令超时 |
 | `MAX_UPLOAD_GB` | `50` | 浏览器上传影像包的总大小上限 |
 | `COLMAP_MATCHER` | `sequential` | 特征匹配策略：`sequential`、`exhaustive`、`vocab_tree`、`spatial`、`transitive` |
@@ -73,10 +244,14 @@ go run ./cmd/server
 | `SIFT_MAX_IMAGE_SIZE` | `3200` | 特征提取的影像长边上限；`0` 表示不限制 |
 | `TILE_GRID` | `0` | Smart3D 瓦片网格每轴维度；`0` 表示按模型面数自动选择 |
 | `LOD_LEVELS` | `0` | 每瓦片 LOD 层级数；`0` 表示按瓦片面数自动选择 |
+| `OSGB_MEMORY_LIMIT` | `12g` | 仅 Compose：容器内存上限 |
+| `OSGB_SHM_SIZE` | `1g` | 仅 Compose：共享内存大小 |
 
 `external` 模式仍支持 `{project_dir}`、`{input_dir}`、`{job_dir}`、`{obj_path}`、`{model_path}`、`{output_path}` 占位符。
 
-Web 右上角“工具配置”可编辑 COLMAP、OpenMVS、`osgconv` 及可选工具位置，保存后立即检测可执行性，并写入 `CONFIG_FILE`。容器部署时，该文件位于持久化 `/data` 卷；若同名变量同时在 Docker Compose `environment` 中指定，则 Compose 环境变量优先。
+Web 右上角“工具配置”可编辑 COLMAP、OpenMVS、`osgconv` 及可选工具位置，保存后立即检测可执行性，并写入 `CONFIG_FILE`。容器部署时该文件位于持久化 `/data` 卷；若同名变量同时在 Compose `environment` 中指定，则 Compose 环境变量优先。
+
+---
 
 ## 性能与纯 CPU 计算
 
@@ -99,23 +274,39 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
 
 ### 线程数
 
-`PIPELINE_THREADS=0`（默认）表示自动：取“可用 CPU 核数 − 1”，上限 16，留一核给服务自身的 HTTP、日志与流式输出。设置成具体数值即可覆盖。上限存在的原因是 COLMAP 与 OpenMVS 会按线程分配缓冲，容器有内存上限（Compose 默认 12 GB），线程数过高会以 OOM 换取速度。
+`PIPELINE_THREADS=0`（默认）表示自动：取“可用 CPU 核数 − 1”，上限 16，留一核给服务自身的 HTTP、日志与流式输出。设置成具体数值即可覆盖。上限存在的原因是 COLMAP 与 OpenMVS 会按线程分配缓冲，容器有内存上限，线程数过高会以 OOM 换取速度。
 
 ### 何时调低参数
 
 若容器因内存不足被终止（日志出现 `signal: killed`），优先降低 `PIPELINE_THREADS`，其次降低 `SIFT_MAX_IMAGE_SIZE`。
 
-## COLMAP 版本兼容
+---
 
-COLMAP 在 4.0 版本重命名了 SIFT 相关选项组：旧版（≤ 3.9）为 `--SiftExtraction.*` / `--SiftMatching.*`，新版（≥ 4.0）为 `--FeatureExtraction.*` / `--FeatureMatching.*`。**两组拼写互斥，传错会直接报 `unrecognised option` 并退出。**
+## Smart3D 分层树的分块与简化
 
-服务会在运行时探测实际使用的 COLMAP 二进制，并自动选择正确的选项组，因此本机与容器版本不同时无需手工配置。探测结果会缓存，不会对每个任务重复执行。若探测失败（二进制缺失等），会回退到旧版拼写，与 Docker 镜像中的 COLMAP 3.9.1 匹配。
+内置分层器把贴图 OBJ 切成瓦片，每片生成多级 LOD，瓦片命名沿用 Smart3D 风格 `Tile_+003_+012`：
 
-Docker 镜像构建时会把容器内 COLMAP 的版本写入 `/opt/colmap-version.txt`，便于排查：
+- 瓦片按三角形 **XY 质心**归属，与 Smart3D/S3C 的地图坐标寻址方式一致
+- 简化会**锁定瓦片包围盒边界带内的顶点**（带宽为瓦片最大边长的 1/64），相邻瓦片因此在其共享边上采样位置一致，不会在拼接处产生裂缝
+- 每一级的顶点数按 4 倍递减（1/4、1/16、1/64…），最细一级始终是未简化的完整网格
+- 若地形以陡崖、建筑立面等垂直结构为主，单个瓦片的竖直跨度会远大于其地图投影范围，包围球随之虚大，LOD 切换阈值偏大。此时任务日志会输出 `tile vertical spread ratio` 提示该情况
 
-```bash
-docker compose exec osgb-service cat /opt/colmap-version.txt
-```
+### 网格与层级自适应
+
+默认（`TILE_GRID=0`、`LOD_LEVELS=0`）会根据模型规模自动选择，避免“小模型切出几百个空瓦片、大模型单瓦片过大”：
+
+| 模型面数 | 网格 | 每瓦片面数 | 层级 |
+|---|---|---|---|
+| 5 万 | 4×4 | 约 3 千 | 2 |
+| 100 万 | 4×4 | 约 6 万 | 3 |
+| 3000 万 | 16×16 | 约 12 万 | 3 |
+
+- 网格：按“每瓦片约 12 万面”反推，钳制在 4×4 到 24×24
+- 层级：稀疏瓦片只给 1 级（再粗也看不出差别），密集瓦片最多 5 级
+
+要**完全复现旧版固定布局**，设置 `TILE_GRID=16` 与 `LOD_LEVELS=3` 即可；每多一级会在每个瓦片上增加 3 次 `osgconv` 调用，因此层数并非越多越好。任务日志会打印本次实际采用的 `grid=` 与 `lod_levels=`，便于核对。
+
+---
 
 ## API
 
@@ -130,7 +321,7 @@ docker compose exec osgb-service cat /opt/colmap-version.txt
 | `GET /api/jobs/:id` | 查询任务状态 |
 | `DELETE /api/jobs/:id/cancel` | 停止正在运行的任务 |
 | `GET /api/jobs/:id/events` | SSE 实时日志、进度和状态 |
-| `GET /api/jobs/:id/download` | 下载完整 OSGB 成果 ZIP（root、Data、纹理、校验报告）。仅限由计划启动且状态为 `completed` 的任务 |
+| `GET /api/jobs/:id/download` | 下载完整 OSGB 成果 ZIP。仅限由计划启动且状态为 `completed` 的任务 |
 | `POST /api/jobs/:id/resume-dense` | 从已有 `scene.mvs` 继续稠密重建，跳过 COLMAP |
 | `POST /api/jobs/:id/resume` | 从最近成功的检查点继续失败的任务（需 `resumable` 为 `true`） |
 | `POST /api/uploads` | `multipart/form-data` 上传字段 `files`，可一次上传完整影像目录 |
@@ -140,7 +331,7 @@ docker compose exec osgb-service cat /opt/colmap-version.txt
 
 ### 瓦片校验与部分交付
 
-每个任务完成时都会用 `osgconv` 回读校验全部 OSGB 瓦片，并写入 `validation_report.json`。校验策略为：
+每个任务完成时都会用 `osgconv` 回读校验全部 OSGB 瓦片，并写入 `validation_report.json`：
 
 | 失败瓦片比例 | 结果 |
 |---|---|
@@ -154,23 +345,38 @@ docker compose exec osgb-service cat /opt/colmap-version.txt
 
 管线中的每个阶段完成后都会写入 `.checkpoint-<阶段名>` 文件。服务重启或任务失败后：
 
-- 状态为 `failed` 且 `resumable` 为 `true` 的任务可通过 `POST /api/jobs/:id/resume` 继续，已完成的阶段会被跳过；
-- 可使用 `POST /api/jobs/:id/resume-dense` 直接从已有 `scene.mvs` 恢复，完全跳过 COLMAP 阶段；
-- 服务在运行中停止时，重启后会把 `running`/`queued` 任务标记为 `failed` 并置为可恢复，不会停留在"永远运行中"状态。
+- 状态为 `failed` 且 `resumable` 为 `true` 的任务可通过 `POST /api/jobs/:id/resume` 继续，已完成的阶段会被跳过
+- 可使用 `POST /api/jobs/:id/resume-dense` 直接从已有 `scene.mvs` 恢复，完全跳过 COLMAP 阶段
+- 服务在运行中停止时，重启后会把 `running`/`queued` 任务标记为 `failed` 并置为可恢复，不会停留在“永远运行中”状态
 
+---
+
+## COLMAP 版本兼容
+
+COLMAP 在 4.0 版本重命名了 SIFT 相关选项组：旧版（≤ 3.9）为 `--SiftExtraction.*` / `--SiftMatching.*`，新版（≥ 4.0）为 `--FeatureExtraction.*` / `--FeatureMatching.*`。**两组拼写互斥，传错会直接报 `unrecognised option` 并退出。**
+
+服务会在运行时探测实际使用的 COLMAP 二进制，并自动选择正确的选项组，因此本机与容器版本不同时无需手工配置。探测结果会缓存，不会对每个任务重复执行。Docker 镜像中的 COLMAP 为 Ubuntu 24.04 提供的 **3.9.1（without CUDA）**。
+
+镜像构建时会把容器内 COLMAP 的版本写入 `/opt/colmap-version.txt`，便于排查：
+
+```bash
+docker compose exec osgb-service cat /opt/colmap-version.txt
+```
+
+---
 
 ## OpenMVS PLY 与 osgconv 兼容性
 
-OpenMVS 生成的二进制 PLY 可能使用 `property list uint8 uint32 vertex_indices`。OSG 3.6.5 PLY 插件虽能识别 `float32/uint8` 等属性类型，但不能识别 `uint32`，转换时会报 `get_binary_item: bad type = 0` 并产生空/残缺 Geode。
+OpenMVS 生成的二进制 PLY 可能使用 `property list uint8 uint32 vertex_indices`。OSG 3.6.5 的 PLY 插件虽能识别 `float32/uint8` 等属性类型，但不能识别 `uint32`，转换时会报 `get_binary_item: bad type = 0` 并产生空/残缺 Geode。
 
-服务已在 `runNative` 和 `runDenseToOSGB` 中自动修复该 PLY，并在 OSGB 写出后强制回读校验：
+服务会在转换前自动修复 PLY 头：
 
 | 处理项 | 原类型 | 替换类型 | 说明 |
 |---|---|---|---|
 | 面索引数量类型 | `uint8` | `uchar` | 二进制保持不变 |
 | 面索引数据类型 | `uint32` | `int` | 二进制保持不变，只改声明 |
 
-转换完成后，服务会用 `osgconv` 将 OSGB 回读为 OSGB 文本，并解析：
+转换完成后，服务会用 `osgconv` 将 OSGB 回读为文本并解析：
 
 | 校验项 | 失败条件 |
 |---|---|
@@ -180,33 +386,42 @@ OpenMVS 生成的二进制 PLY 可能使用 `property list uint8 uint32 vertex_i
 
 校验结果会写入任务日志、`job.json` 的 `stats` 字段和 UI 的任务信息区。
 
-## Smart3D 分层树的分块与简化
+---
 
-内置分层器把贴图 OBJ 切成瓦片，每片生成多级 LOD，瓦片命名沿用 Smart3D 风格 `Tile_+003_+012`：
+## 坐标与长期交付说明
 
-- 瓦片按三角形 **XY 质心**归属，与 Smart3D/S3C 的地图坐标寻址方式一致。
-- 简化会**锁定瓦片包围盒边界带内的顶点**（带宽为瓦片最大边长的 1/64），相邻瓦片因此在其共享边上采样位置一致，不会在拼接处产生裂缝。
-- 每一级的顶点数按 4 倍递减（1/4、1/16、1/64…），最细一级始终是未简化的完整网格。
-- 若地形以陡崖、建筑立面等垂直结构为主，单个瓦片的竖直跨度会远大于其地图投影范围，包围球随之虚大，LOD 切换阈值偏大。此时任务日志会输出 `tile vertical spread ratio` 提示该情况，便于判断扁平 XY 网格是否适合本次数据。
+OpenMVS 默认输出局部坐标。要交付绝对地理坐标，照片 EXIF 或 GCP 必须包含可靠的坐标和高程基准，并在生产环境增加坐标转换/检查步骤。服务会保留每个任务的清单、中间产物、日志与计划；任务和计划索引均持久化在 `/data`，服务重启后会恢复到 Web 列表。
 
-### 网格与层级自适应
+默认 `OPENMVS_DENSIFY_ARGS` 已使用 CPU 稠密重建/融合；已有 `depth*.dmap` 时，OpenMVS 会复用它们并直接进入融合。若自行覆盖该变量，请不要加入 `--cuda-device`。
 
-默认（`TILE_GRID=0`、`LOD_LEVELS=0`）会根据模型规模自动选择，避免"小模型切出几百个空瓦片、大模型单瓦片过大"：
+Docker 镜像安装的是 Ubuntu 软件包版 COLMAP、OpenMVS 与 OpenSceneGraph，适合 CPU 验证与小规模生产。Windows 的 `.exe` 不能直接复制进 Linux 容器使用。
 
-| 模型面数 | 网格 | 每瓦片面数 | 层级 |
-|---|---|---|---|
-| 5 万 | 4×4 | 约 3 千 | 2 |
-| 100 万 | 4×4 | 约 6 万 | 3 |
-| 3000 万 | 16×16 | 约 12 万 | 3 |
+---
 
-- 网格：按"每瓦片约 12 万面"反推，钳制在 4×4 到 24×24。
-- 层级：稀疏瓦片只给 1 级（再粗也看不出差别），密集瓦片最多 5 级。
+## Windows 路径写法
 
-要**完全复现旧版固定布局**，设置 `TILE_GRID=16` 与 `LOD_LEVELS=3` 即可；每多一级会在每个瓦片上增加 3 次 `osgconv` 调用，因此层数并非越多越好。任务日志会打印本次实际采用的 `grid=` 与 `lod_levels=`，便于核对。
+工具路径与命令参数模板支持正斜杠和反斜杠两种写法，例如下面两种都能正确解析：
 
-## 代码检查
+```ini
+OSGCONV_BIN=E:/OpenSceneGraph-3.6.5/bin/osgconv.exe
+OSGCONV_BIN=E:\OpenSceneGraph-3.6.5\bin\osgconv.exe
+```
 
-提交前请确保以下三项均通过：
+含空格的路径请用双引号包裹。注意：形如 `"C:\dir\"` 的写法中，结尾反斜杠紧邻右引号，与“转义引号”存在本质歧义，解析器会报 `unterminated quote`；请去掉结尾反斜杠，或改用正斜杠 `"C:/dir/"`。
+
+---
+
+## 开发
+
+```bash
+# 后端：热重载式开发
+go run ./cmd/server
+
+# 前端：独立开发服务器（自动代理 /api 到 8080）
+cd frontend && npm run dev
+```
+
+提交前请确保以下检查全部通过：
 
 ```bash
 gofmt -l ./cmd/                 # 应无输出
@@ -215,56 +430,30 @@ golangci-lint run ./...         # 配置见 .golangci.yml，应零告警
 go test -count=1 ./cmd/server/
 ```
 
+代码结构：
+
+| 文件 | 职责 |
+|---|---|
+| `cmd/server/main.go` | 配置、任务与计划管理、流水线编排、PLY 兼容、HTTP API |
+| `cmd/server/colmap_args.go` | COLMAP 选项组探测与 CPU-only 参数构建 |
+| `cmd/server/pagedlod.go` | OBJ 解析、瓦片切分、网格简化、OBJ 导出 |
+| `cmd/server/pagedlod_tree.go` | PagedLOD 树构建、纹理降采样、OSGB 校验与报告 |
+| `frontend/src/App.vue` | 整页 UI |
+
 `.golangci.yml` 中每一项豁免都写明了理由（例如作业刻意不继承 HTTP 请求的 context，因为重建任务必须在浏览器断开后继续运行）。
 
-## 坐标与长期交付说明
+---
 
-OpenMVS 默认输出局部坐标。要交付绝对地理坐标，照片 EXIF 或 GCP 必须包含可靠的坐标和高程基准，并在生产环境增加坐标转换/检查步骤。服务会保留每个任务的清单、中间产物、日志与计划；任务和计划索引均持久化在 `/data`，服务重启后会恢复到 Web 列表。
+## 疑难排查
 
-默认 `OPENMVS_DENSIFY_ARGS` 已使用 CPU 稠密重建/融合；已有 `depth*.dmap` 时，OpenMVS 会复用它们并直接进入融合。若自行覆盖该变量，请不要加入 `--cuda-device`。
-
-## Windows 路径写法
-
-`.env` 中的工具路径与命令参数模板支持正斜杠和反斜杠两种写法，例如下面两种都能正确解析：
-
-```text
-OSGCONV_BIN=E:/OpenSceneGraph-3.6.5/bin/osgconv.exe
-OSGCONV_BIN=E:\OpenSceneGraph-3.6.5\bin\osgconv.exe
-```
-
-含空格的路径请用双引号包裹。注意：形如 `"C:\dir\"` 的写法中，结尾反斜杠紧邻右引号，与"转义引号"存在本质歧义，解析器会报 `unterminated quote`；请去掉结尾反斜杠，或改用正斜杠 `"C:/dir/"`。
-
-## Docker 部署
-
-项目根目录已经提供 `Dockerfile`、`compose.yaml` 和 `.dockerignore`。镜像在一个容器中运行服务端与 Web 端：`/` 是 Web UI，`/api` 是 Go API。数据卷 `/data` 会持久化上传影像、计划、任务日志和交付成果，重启容器不会丢失计划或已完成任务。
-
-```bash
-cd osgb-service
-mkdir -p runtime input
-docker compose up -d --build
-```
-
-也可以执行项目内的一键安装脚本：
-
-```bash
-bash ./scripts/install-tools.sh
-```
-
-脚本会校验 Docker Compose、构建镜像并由 `Dockerfile` 自动安装 COLMAP、OpenMVS
-和 OpenSceneGraph，最后重建服务容器。Web 服务本身以非 root 用户运行，不会在请求中执行
-`apt install`，也不会挂载 Docker socket；这避免了让浏览器端获得宿主机 root 权限，同时保证
-工具版本随镜像可复现。右上角“工具配置”弹窗会显示该 Docker/Linux 安装命令并提供复制按钮。
-
-容器健康检查会同时检测 COLMAP、OpenMVS 和 `osgconv` 是否全部可执行；若镜像构建缺失工具，
-容器会显示为 `unhealthy`，Web 的环境检测也会显示未检测到的具体工具。
-
-浏览器访问 `http://localhost:8080`。Web 页面提供两种数据入口：
-
-| 入口 | 适用情况 | 容器内位置 |
-|---|---|---|
-| 上传影像 | 操作员从浏览器选择一个航飞影像文件夹 | 自动保存至 `/data/uploads/...` |
-| 挂载目录 | 数据量很大、不希望浏览器上传 | 将宿主机目录挂载为 `./input:/mnt/input:ro`，在页面填 `/mnt/input/子目录` |
-
-每次由计划启动的任务都会写入 `/data/deliverables/<plan-id>/<job-id>/`，完成后页面“下载 OSGB 成果包”会下载该目录的 ZIP，包含 `root.osgb`、`Data/` 层级瓦片、纹理和 `validation_report.json`。
-
-默认 Dockerfile 安装 Ubuntu 软件包版 COLMAP、OpenMVS 与 OpenSceneGraph，适合 CPU 验证与小规模生产。镜像中的 COLMAP 为 Ubuntu 24.04 提供的 **3.9.1（without CUDA）**；服务会自动适配其选项组拼写，无需手工配置。GPU 生产应从此镜像派生，替换为已在目标显卡验证过的 CUDA 版 COLMAP/OpenMVS，并配置 NVIDIA Container Toolkit；服务接口与数据卷无需改变（服务本身只按 CPU 方式调用这些工具）。Windows 的 `.exe` 不能直接复制进 Linux 容器使用。
+| 现象 | 原因与处理 |
+|---|---|
+| 页面显示“等待重建引擎配置” | 7 个工具未全部就绪。打开右上角“工具配置”查看哪一个未检测到 |
+| 容器 unhealthy | 镜像构建缺失工具。执行 `docker compose logs osgb-service` 查看详情 |
+| 日志出现 `signal: killed` | 容器内存不足。降低 `PIPELINE_THREADS`，或提高 `OSGB_MEMORY_LIMIT` |
+| 空三只恢复部分影像 / 点云断裂 | 相邻航线未连接。增大 `COLMAP_MATCHER_OVERLAP` |
+| `unrecognised option '--Sift...'` | COLMAP 版本与选项组不匹配。本服务会自动探测，若出现请检查 `COLMAP_BIN` 是否指向了预期版本 |
+| 瓦片无纹理 | `osgconv` 缺少 `osgPlugins-*` 目录或 DLL。不要只复制单个 `osgconv.exe` |
+| 端口 8080 被占用 | 在 `.env` 中设置 `PORT=8098`，并同步修改 `compose.yaml` 的端口映射 |
+| 下载按钮不可用 | 成果包仅支持**由计划启动**且状态为 `completed` 的任务 |
+| 上次任务卡在“运行中” | 服务重启后会自动标记为 `failed` 且可恢复，点击“从检查点继续”即可 |
