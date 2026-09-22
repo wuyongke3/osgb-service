@@ -274,6 +274,11 @@ func NewJobManager(config Config, logger *slog.Logger) *JobManager {
 	manager := &JobManager{jobs: make(map[string]*jobRecord), plans: make(map[string]*Plan), cancel: make(map[string]context.CancelFunc), config: config, logger: logger}
 	manager.loadPersisted()
 	manager.loadPlans()
+	// Must run after both loads: reconciliation compares each plan against the
+	// jobs that reference it, so neither side may still be empty. Calling it
+	// from loadPersisted (as the first version did) ran before plans existed and
+	// silently repaired nothing.
+	manager.reconcilePlanStatuses()
 	go manager.runPlanScheduler()
 	return manager
 }
@@ -753,6 +758,67 @@ func (m *JobManager) loadPersisted() {
 		}
 		job.Resumable = job.Status == "failed" && job.Phase != phaseCompleted
 		m.jobs[job.ID] = &jobRecord{job: job, subscribers: make(map[chan event]struct{})}
+	}
+}
+
+// reconcilePlanStatuses repairs plans left claiming "running" after a restart.
+//
+// loadPersisted demotes interrupted jobs to failed, but the plan that started
+// them kept whatever status it had. A plan stuck at "running" is not merely
+// cosmetic: the delete path refuses to remove a plan with a live job, and the UI
+// disables its checkbox, so the plan can never be cleaned up. Recovery derives
+// the plan status from its jobs instead of trusting the stored value.
+func (m *JobManager) reconcilePlanStatuses() {
+	// Collect the repairs first, then persist them after releasing the lock,
+	// so the lock is held only for the in-memory update.
+	type repair struct {
+		id   string
+		from string
+		to   string
+	}
+	var repairs []repair
+
+	m.mu.Lock()
+	for _, plan := range m.plans {
+		if plan.Status != "running" {
+			continue
+		}
+		hasActiveJob := false
+		hasAnyJob := false
+		allCompleted := true
+		for _, record := range m.jobs {
+			if record.job.PlanID != plan.ID {
+				continue
+			}
+			hasAnyJob = true
+			if record.job.Status == "running" || record.job.Status == "queued" {
+				hasActiveJob = true
+			}
+			if record.job.Status != "completed" {
+				allCompleted = false
+			}
+		}
+		if hasActiveJob {
+			// A job really is live; leave the plan alone.
+			continue
+		}
+		target := "failed"
+		if hasAnyJob && allCompleted {
+			target = "completed"
+		}
+		previous := plan.Status
+		plan.Status = target
+		plan.UpdatedAt = time.Now()
+		repairs = append(repairs, repair{id: plan.ID, from: previous, to: target})
+	}
+	m.mu.Unlock()
+
+	for _, item := range repairs {
+		m.logger.Info("reconciled plan status after restart",
+			"plan_id", item.id, "from", item.from, "to", item.to)
+		if plan := m.planSnapshot(item.id); plan != nil {
+			m.persistPlan(plan)
+		}
 	}
 }
 
@@ -2220,6 +2286,11 @@ func (m *JobManager) handlePlans(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"plans": m.planSnapshots()})
 			return
 		}
+		// Batch deletion: DELETE /api/plans with {"ids": [...]}.
+		if r.Method == http.MethodDelete {
+			m.handleDeletePlans(w, r, "")
+			return
+		}
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w)
 			return
@@ -2290,6 +2361,11 @@ func (m *JobManager) handlePlans(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
+	// Single-plan deletion: DELETE /api/plans/:id.
+	if len(parts) == 3 && parts[0] == "api" && parts[1] == "plans" {
+		m.handleDeletePlans(w, r, parts[2])
 		return
 	}
 	http.NotFound(w, r)
@@ -2677,6 +2753,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, map[string]any{"code": code, "detail": detail})
+}
+
+// decodeLimitedJSON decodes a small JSON request body, rejecting anything
+// oversized. All request bodies are small control messages, so a fixed limit
+// avoids letting a client stream an unbounded payload into memory.
+func decodeLimitedJSON(r *http.Request, target any) error {
+	return json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(target)
 }
 
 func writeSSE(w io.Writer, eventType string, value any) {

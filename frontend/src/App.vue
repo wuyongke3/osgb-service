@@ -31,6 +31,12 @@ const isSavingTools = ref(false)
 const showToolSettings = ref(false)
 const toolDraft = ref<Record<string, string>>({})
 const installCommandCopied = ref(false)
+// Plans ticked in the left list. Selection is kept as a Set of ids so it
+// survives the list being refreshed after a delete.
+const checkedPlanIds = ref<Set<string>>(new Set())
+const selectedPlanId = ref('')
+const isDeleting = ref(false)
+const deleteNotice = ref('')
 let eventSource: EventSource | null = null
 
 const phases = [
@@ -84,6 +90,59 @@ async function createPlan(startNow: boolean) {
   } catch (error) { errorMessage.value = error instanceof Error ? error.message : '创建计划失败' } finally { isCreating.value = false }
 }
 async function runPlan(plan: Plan) { try { selectJob(await request<Job>(`/api/plans/${encodeURIComponent(plan.id)}/run`, { method: 'POST' })); await refresh() } catch (error) { errorMessage.value = error instanceof Error ? error.message : '启动计划失败' } }
+
+// Plans are selected, not started, when clicked. Starting is a deliberate
+// second click because a run occupies the pipeline for hours.
+function selectPlan(plan: Plan) { selectedPlanId.value = plan.id; errorMessage.value = ''; deleteNotice.value = '' }
+function togglePlanCheck(planId: string, checked: boolean) {
+  const next = new Set(checkedPlanIds.value)
+  if (checked) next.add(planId); else next.delete(planId)
+  checkedPlanIds.value = next
+}
+function clearCheckedPlans() { checkedPlanIds.value = new Set() }
+const checkedCount = computed(() => checkedPlanIds.value.size)
+// A plan can be deleted unless one of its jobs is running: deleting the
+// workspace out from under a live subprocess would corrupt the run.
+const runningPlanIds = computed(() => new Set(jobs.value.filter(item => item.status === 'running' || item.status === 'queued').map(item => item.plan_id).filter((id): id is string => Boolean(id))))
+const selectablePlans = computed(() => plans.value.filter(plan => !runningPlanIds.value.has(plan.id)))
+const canDeleteChecked = computed(() => checkedCount.value > 0 && !isDeleting.value)
+
+function toggleCheckAll(checked: boolean) {
+  checkedPlanIds.value = checked ? new Set(selectablePlans.value.map(plan => plan.id)) : new Set()
+}
+
+async function deleteCheckedPlans() {
+  const ids = [...checkedPlanIds.value]
+  if (!ids.length || isDeleting.value) return
+  const names = plans.value.filter(plan => checkedPlanIds.value.has(plan.id)).map(plan => plan.name)
+  const confirmed = window.confirm(
+    `确定删除以下 ${ids.length} 个计划吗？\n\n${names.join('\n')}\n\n` +
+    '这会同时删除它们的成果包、任务临时产物和已上传的影像，且无法恢复。'
+  )
+  if (!confirmed) return
+  await deletePlans(ids)
+}
+
+async function deletePlans(ids: string[]) {
+  isDeleting.value = true; errorMessage.value = ''; deleteNotice.value = ''
+  try {
+    const result = await request<{ deleted: { name: string; freed_bytes: number }[]; failed: Record<string, string>; succeeded: number }>(
+      '/api/plans', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }
+    )
+    const freed = result.deleted.reduce((sum, item) => sum + (item.freed_bytes || 0), 0)
+    const failedNames = Object.keys(result.failed ?? {})
+    if (failedNames.length) {
+      deleteNotice.value = `已删除 ${result.succeeded} 个，释放 ${formatBytes(freed)}；${failedNames.length} 个失败：${Object.values(result.failed).join('；')}`
+    } else {
+      deleteNotice.value = `已删除 ${result.succeeded} 个计划，释放 ${formatBytes(freed)}`
+    }
+    clearCheckedPlans()
+    if (ids.includes(selectedPlanId.value)) { selectedPlanId.value = ''; job.value = null; closeEvents() }
+    await refresh()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '删除计划失败'
+  } finally { isDeleting.value = false }
+}
 async function cancelJob() { if (!job.value) return; try { job.value = await request<Job>(`/api/jobs/${encodeURIComponent(job.value.id)}/cancel`, { method: 'DELETE' }); closeEvents(); await refresh() } catch (error) { errorMessage.value = error instanceof Error ? error.message : '停止失败' } }
 async function resumeJob() {
   if (!job.value?.resumable) return
@@ -123,7 +182,31 @@ onMounted(refresh); onBeforeUnmount(closeEvents)
         <label class="field"><span>预约执行时间（可选）</span><input v-model="scheduledAt" type="datetime-local" /><small>留空则保存为草稿；可从右侧计划列表手动启动。</small></label>
         <div class="action-grid"><button class="secondary" :disabled="!canCreate" @click="createPlan(false)">保存计划</button><button class="primary-action" :disabled="!canCreate" @click="createPlan(true)">{{ isCreating ? '创建中…' : '立即重建 OSGB' }}</button></div>
         <p v-if="errorMessage" class="error-banner">{{ errorMessage }}</p>
-        <section class="plan-list"><div class="list-heading"><span>已保存计划</span><span>{{ plans.length }}</span></div><div v-if="!plans.length" class="empty-text">尚无计划</div><button v-for="plan in plans" :key="plan.id" class="plan-item" :disabled="plan.status === 'running'" @click="runPlan(plan)"><span><strong>{{ plan.name }}</strong><small>{{ plan.upload_id ? '已上传影像' : plan.input_path }}</small></span><em :class="plan.status">{{ statusText(plan.status) }}</em></button></section>
+        <p v-if="deleteNotice" class="ok-note">{{ deleteNotice }}</p>
+        <section class="plan-list">
+          <div class="list-heading">
+            <span>已保存计划</span>
+            <span>{{ plans.length }}</span>
+          </div>
+          <div v-if="plans.length" class="plan-toolbar">
+            <label class="check-all">
+              <input type="checkbox" :checked="selectablePlans.length > 0 && checkedCount === selectablePlans.length" :indeterminate.prop="checkedCount > 0 && checkedCount < selectablePlans.length" :disabled="!selectablePlans.length" @change="toggleCheckAll(($event.target as HTMLInputElement).checked)" />
+              <span>全选</span>
+            </label>
+            <button class="danger compact" :disabled="!canDeleteChecked" @click="deleteCheckedPlans">{{ isDeleting ? '删除中…' : `删除选中${checkedCount ? `（${checkedCount}）` : ''}` }}</button>
+          </div>
+          <div v-if="!plans.length" class="empty-text">尚无计划</div>
+          <div v-for="plan in plans" :key="plan.id" class="plan-row" :class="{ active: selectedPlanId === plan.id }">
+            <label class="plan-check" :title="runningPlanIds.has(plan.id) ? '任务运行中，无法删除' : '选择此计划'">
+              <input type="checkbox" :checked="checkedPlanIds.has(plan.id)" :disabled="runningPlanIds.has(plan.id)" @change="togglePlanCheck(plan.id, ($event.target as HTMLInputElement).checked)" />
+            </label>
+            <button class="plan-item" @click="selectPlan(plan)">
+              <span><strong>{{ plan.name }}</strong><small>{{ plan.upload_id ? '已上传影像' : plan.input_path }}</small></span>
+              <em :class="plan.status">{{ statusText(plan.status) }}</em>
+            </button>
+            <button class="run-plan compact" :disabled="runningPlanIds.has(plan.id)" :title="runningPlanIds.has(plan.id) ? '任务运行中' : '开始重建'" @click="runPlan(plan)">{{ runningPlanIds.has(plan.id) ? '运行中' : '开始' }}</button>
+          </div>
+        </section>
       </aside>
       <section class="monitor-panel">
         <div class="monitor-header"><div><p class="eyebrow">LIVE JOB MONITOR</p><h2>{{ job ? `任务 ${job.id.slice(-12)}` : '等待任务' }}</h2></div><div class="monitor-actions"><button v-if="isRunning" class="secondary compact" @click="cancelJob">停止任务</button><button v-if="job?.status === 'failed' && job.resumable" class="primary-action compact" @click="resumeJob">从检查点继续</button><button v-if="job?.status === 'completed'" class="download" @click="download">下载 OSGB 成果包</button><span class="job-status" :class="job?.status">{{ statusText(job?.status) }}</span></div></div>
