@@ -94,9 +94,12 @@ func (s colmapOptionStyle) matchingGroup() string {
 
 // featureExtractorArgs builds the argv for `colmap feature_extractor`.
 //
-// Everything here is CPU-only: use_gpu is explicitly 0 rather than left at
-// COLMAP's default of 1, so the command cannot accidentally attempt CUDA
-// initialisation in a container that has no GPU.
+// GPU use is opt-in: when config.UseGPU is set the command passes use_gpu 1 and
+// the selected gpu_index; otherwise use_gpu is explicitly 0, so a CPU-only
+// deployment can never accidentally attempt CUDA initialisation. When the GPU
+// is enabled, CPU worker count is irrelevant for the extraction kernel itself,
+// but is still passed because COLMAP runs image loading and descriptor
+// conversion on the host threads.
 func featureExtractorArgs(config Config, database, imageDir string) []string {
 	style := detectColmapOptionStyle(config.ColmapBin)
 	group := style.extractionGroup()
@@ -106,12 +109,17 @@ func featureExtractorArgs(config Config, database, imageDir string) []string {
 		"--image_path", imageDir,
 		"--ImageReader.single_camera", "1",
 	}
-	// CPU-only, with an explicit worker count. num_threads=-1 would mean
-	// "use every core", which competes with the HTTP server and log readers.
+	useGPU := "0"
+	if config.UseGPU {
+		useGPU = "1"
+	}
 	args = append(args,
-		"--"+group+".use_gpu", "0",
+		"--"+group+".use_gpu", useGPU,
 		"--"+group+".num_threads", fmt.Sprint(config.resolveThreads()),
 	)
+	if config.UseGPU {
+		args = append(args, "--"+group+".gpu_index", fmt.Sprint(config.GPUIndex))
+	}
 	if config.MaxImageSize > 0 {
 		args = append(args, "--"+group+".max_image_size", fmt.Sprint(config.MaxImageSize))
 	}
@@ -146,12 +154,18 @@ func matcherCommand(matcher string) string {
 // single largest saving available in the pipeline.
 func matcherArgs(config Config, database string) []string {
 	style := detectColmapOptionStyle(config.ColmapBin)
+	useGPU := "0"
+	if config.UseGPU {
+		useGPU = "1"
+	}
 	args := []string{
 		matcherCommand(config.Matcher),
 		"--database_path", database,
-		// CPU-only, as everywhere else in the pipeline.
-		"--" + style.matchingGroup() + ".use_gpu", "0",
+		"--" + style.matchingGroup() + ".use_gpu", useGPU,
 		"--" + style.matchingGroup() + ".num_threads", fmt.Sprint(config.resolveThreads()),
+	}
+	if config.UseGPU {
+		args = append(args, "--"+style.matchingGroup()+".gpu_index", fmt.Sprint(config.GPUIndex))
 	}
 	if matcherCommand(config.Matcher) == "sequential_matcher" {
 		overlap := config.MatcherOverlap
@@ -185,5 +199,11 @@ func describeMatcherStrategy(config Config, imageCount int) string {
 	return "matcher=" + command
 }
 
-// colmapCPUNote documents the CPU-only guarantee for logs and diagnostics.
-const colmapCPUNote = "CPU-only: GPU switches are forced off for every COLMAP and OpenMVS stage"
+// computeModeNote describes whether this run uses the GPU or is CPU-only, so the
+// operator can tell at a glance from the job log which path is active.
+func computeModeNote(config Config) string {
+	if config.UseGPU {
+		return fmt.Sprintf("CUDA enabled (gpu_index=%d)", config.GPUIndex)
+	}
+	return "CPU-only: GPU switches are forced off for every COLMAP and OpenMVS stage"
+}

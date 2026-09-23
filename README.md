@@ -255,6 +255,8 @@ go test -count=1 ./cmd/server/
 | `SIFT_MAX_IMAGE_SIZE` | `3200` | 特征提取的影像长边上限；`0` 表示不限制 |
 | `TILE_GRID` | `0` | Smart3D 瓦片网格每轴维度；`0` 表示按模型面数自动选择 |
 | `LOD_LEVELS` | `0` | 每瓦片 LOD 层级数；`0` 表示按瓦片面数自动选择 |
+| `USE_GPU` | `0` | 设为 `1` 时用 CUDA 提取/匹配特征；需 CUDA 版 COLMAP 与可用 GPU |
+| `COLMAP_GPU_INDEX` | `-1` | CUDA 设备编号；`-1` 让 COLMAP 自动选择 |
 | `OSGB_MEMORY_LIMIT` | `12g` | 仅 Compose：容器内存上限 |
 | `OSGB_SHM_SIZE` | `1g` | 仅 Compose：共享内存大小 |
 
@@ -266,9 +268,9 @@ Web 右上角“工具配置”可编辑 COLMAP、OpenMVS、`osgconv` 及可选�
 
 ## 性能与纯 CPU 计算
 
-**本服务全程不使用 GPU。** COLMAP 与 OpenMVS 的所有 GPU 开关都被显式关闭（COLMAP 的 `use_gpu` 默认为 1，必须显式传 0），并且每个子进程都会清空 `CUDA_VISIBLE_DEVICES` 作为第二道保险。因此构建镜像不需要 NVIDIA Container Toolkit，普通 Docker 主机即可运行。
+**默认全程不使用 GPU。** COLMAP 与 OpenMVS 的所有 GPU 开关都被显式关闭（COLMAP 的 `use_gpu` 默认为 1，必须显式传 0），并且每个子进程都会清空 `CUDA_VISIBLE_DEVICES` 作为第二道保险。因此构建镜像不需要 NVIDIA Container Toolkit，普通 Docker 主机即可运行。
 
-因为全部算力来自 CPU，**线程数与匹配策略是决定总耗时的两个关键参数**。
+因为默认算力全部来自 CPU，**线程数与匹配策略是决定总耗时的两个关键参数**。
 
 ### 匹配策略（影响最大）
 
@@ -293,6 +295,29 @@ matcher=sequential_matcher overlap=10, candidate image pairs=4280
 内存是真正的约束。实测（12 GB 容器、3200px 影像）：2 线程峰值 4.5 GB、4 线程 8.9 GB，而 8 线程直接被 OOM 杀掉（`exit 137`）。因此自动推导会把 12 GB 容器里的特征提取限制在 4 个线程。
 
 设置成具体数值即可覆盖（例如 `PIPELINE_THREADS=8`），但请确保容器内存足够，否则会重现 OOM。若机器内存充裕、想压榨性能，可同时调大 `OSGB_MEMORY_LIMIT`。
+
+### GPU 加速（可选）
+
+**特征提取是整个管线里最适合 GPU 加速的阶段**。实测：428 张 2000 万像素影像在 CPU 上提取特征约需 22 分钟（4 线程），而 CUDA 版 COLMAP 通常能快一个数量级，且**基本不失精度**——因为 SIFT 算子本身不变，只是用 GPU 并行。
+
+启用方式：
+
+```ini
+USE_GPU=1
+COLMAP_GPU_INDEX=-1   # -1 让 COLMAP 自动选择设备
+```
+
+**前提条件**（缺一不可）：
+
+1. `COLMAP_BIN` 指向 **CUDA 版**的 COLMAP 可执行文件。Ubuntu 软件包版（`apt install colmap`）是 `without CUDA`，没有 GPU 能力。
+2. 有可用的 NVIDIA GPU 与驱动。启用后对 CPU 版 COLMAP 传 `use_gpu=1` 会在启动时报 CUDA 错误，**不会静默回退**。
+
+- **Windows 本机**：下载 `colmap-x64-windows-cuda` 版本，把 `COLMAP_BIN` 指向它的 `colmap.exe`，再设 `USE_GPU=1` 即可。
+- **Docker 部署**：默认镜像的 COLMAP 是 CPU 版。要 GPU 加速需额外（a）把镜像换成 CUDA 版 COLMAP，（b）给容器配 NVIDIA Container Toolkit 并用 `--gpus all` 直通。这两步没有做进默认 `Dockerfile`，因为它破坏了"普通 Docker 主机即可运行"的默认承诺。
+
+启用后任务日志的第一行会从 `CPU-only: ...` 变为 `CUDA enabled (gpu_index=...)`，可据此确认是否真的走了 GPU。
+
+> **安全默认**：`USE_GPU` 默认关闭，且 `runCommand` 在关闭时会清空 `CUDA_VISIBLE_DEVICES`，从环境层面兜底。只有显式打开时才放行 GPU。
 
 ### 何时调低参数
 

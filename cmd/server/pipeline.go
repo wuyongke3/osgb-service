@@ -200,7 +200,7 @@ func (m *JobManager) runNative(id, imageDir, jobDir, manifest string) {
 	if current := m.snapshot(id); current != nil {
 		imageCount = current.InputCount
 	}
-	m.logLine(id, "system", fmt.Sprintf("%s; threads=%d", colmapCPUNote, m.config.resolveThreads()))
+	m.logLine(id, "system", fmt.Sprintf("%s; threads=%d", computeModeNote(m.config), m.config.resolveThreads()))
 	m.logLine(id, "system", describeMatcherStrategy(m.config, imageCount))
 	steps := []struct {
 		phase string
@@ -684,13 +684,17 @@ func (m *JobManager) runCommand(id, binary, argTemplate string, vars map[string]
 	cmd.Dir = workDir
 	// COLMAP links Qt and initializes a platform plugin even for CLI commands.
 	// Force a headless backend so Docker/Linux runs do not require DISPLAY/X11.
-	// CUDA_VISIBLE_DEVICES="" is the strongest portable way to hide any GPU that
-	// might be present, backing up the per-command use_gpu=0 switches.
 	cmd.Env = append(os.Environ(),
 		"QT_QPA_PLATFORM=offscreen",
 		"DISPLAY=",
-		"CUDA_VISIBLE_DEVICES=",
 	)
+	// Hide any GPU unless GPU use was explicitly enabled. Clearing
+	// CUDA_VISIBLE_DEVICES is the strongest portable way to guarantee a CPU-only
+	// run, and it backs up the per-command use_gpu=0 switch. When UseGPU is set
+	// the variable is left untouched so the CUDA runtime can see the device.
+	if !m.config.UseGPU {
+		cmd.Env = append(cmd.Env, "CUDA_VISIBLE_DEVICES=")
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("open stdout: %w", err)

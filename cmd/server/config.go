@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -79,6 +80,16 @@ type Config struct {
 	// LODLevels is the per-tile LOD chain depth. Zero means choose it from the
 	// per-tile face count.
 	LODLevels int
+	// UseGPU enables CUDA for the COLMAP feature extraction and matching stages.
+	//
+	// It is off by default and stays off for the CPU-only Docker image. Enabling
+	// it requires a CUDA-enabled COLMAP binary and, inside a container, the
+	// NVIDIA runtime with the GPU passed through; without those, COLMAP fails at
+	// startup with a CUDA error rather than silently falling back to CPU.
+	UseGPU bool
+	// GPUIndex selects which CUDA device to use, mirroring COLMAP's gpu_index
+	// option. The default of -1 lets COLMAP pick automatically.
+	GPUIndex int
 }
 
 // Memory model for the automatically derived worker count.
@@ -190,6 +201,20 @@ func (c Config) resolveThreads() int {
 // maxAutoThreads caps the automatically derived worker count.
 const maxAutoThreads = 16
 
+// envBool reads a boolean environment variable, treating 1, true, yes and on
+// (case-insensitive) as true and anything else, including absence, as false.
+func envBool(name string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "":
+		return fallback
+	default:
+		return false
+	}
+}
+
 func loadConfig() Config {
 	dataDir := envOr("DATA_DIR", "./runtime")
 	return Config{
@@ -222,6 +247,8 @@ func loadConfig() Config {
 		MaxImageSize:   int(envInt64("SIFT_MAX_IMAGE_SIZE", 3200)),
 		TileGrid:       int(envInt64AllowZero("TILE_GRID", 0)),
 		LODLevels:      int(envInt64AllowZero("LOD_LEVELS", 0)),
+		UseGPU:         envBool("USE_GPU", false),
+		GPUIndex:       int(envInt64AllowZero("COLMAP_GPU_INDEX", -1)),
 	}
 }
 

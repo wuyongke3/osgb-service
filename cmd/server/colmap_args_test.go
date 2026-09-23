@@ -70,6 +70,84 @@ func hasFlagValue(args []string, flag, value string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// GPU opt-in
+// ---------------------------------------------------------------------------
+
+// TestFeatureExtractorEnablesGPUWhenConfigured: USE_GPU turns on the CUDA switch
+// and passes the selected device index instead of forcing the CPU default.
+func TestFeatureExtractorEnablesGPUWhenConfigured(t *testing.T) {
+	config := Config{UseGPU: true, GPUIndex: -1}
+	args := featureExtractorArgs(config, "db.db", "imgs")
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "use_gpu 1") {
+		t.Fatalf("GPU-enabled extractor args do not set use_gpu 1: %v", args)
+	}
+	if strings.Contains(joined, "use_gpu 0") {
+		t.Fatalf("GPU-enabled extractor args still force the CPU: %v", args)
+	}
+}
+
+// TestMatcherEnablesGPUWhenConfigured mirrors the extractor for the matcher.
+func TestMatcherEnablesGPUWhenConfigured(t *testing.T) {
+	config := Config{Matcher: "sequential", MatcherOverlap: 10, UseGPU: true, GPUIndex: 0}
+	args := matcherArgs(config, "db.db")
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "use_gpu 1") {
+		t.Fatalf("GPU-enabled matcher args do not set use_gpu 1: %v", args)
+	}
+	if !hasFlagValue(args, "--SiftMatching.gpu_index", "0") &&
+		!hasFlagValue(args, "--FeatureMatching.gpu_index", "0") {
+		t.Fatalf("GPU-enabled matcher args do not pass gpu_index: %v", args)
+	}
+}
+
+// TestGPUDefaultsToOff: a zero-value Config must stay CPU-only, because the
+// deployment image has no CUDA and enabling it by accident would fail every job.
+func TestGPUDefaultsToOff(t *testing.T) {
+	config := Config{}
+	if config.UseGPU {
+		t.Fatal("UseGPU defaults to true; the safe default is off")
+	}
+	args := featureExtractorArgs(config, "db.db", "imgs")
+	if strings.Contains(strings.Join(args, " "), "use_gpu 1") {
+		t.Fatalf("default extractor args enable the GPU: %v", args)
+	}
+}
+
+// TestComputeModeNoteReflectsConfig pins the log line so an operator can tell at
+// a glance which path a job took.
+func TestComputeModeNoteReflectsConfig(t *testing.T) {
+	if note := computeModeNote(Config{}); !strings.Contains(note, "CPU-only") {
+		t.Errorf("CPU note = %q, want it to mention CPU-only", note)
+	}
+	if note := computeModeNote(Config{UseGPU: true, GPUIndex: 0}); !strings.Contains(note, "CUDA") {
+		t.Errorf("GPU note = %q, want it to mention CUDA", note)
+	}
+}
+
+// TestEnvBool covers the boolean parsing used for USE_GPU.
+func TestEnvBool(t *testing.T) {
+	t.Setenv("TEST_USE_GPU", "")
+	if envBool("TEST_USE_GPU", false) {
+		t.Error("empty value should fall back to false")
+	}
+	for _, value := range []string{"1", "true", "yes", "on", "TRUE", "On"} {
+		t.Setenv("TEST_USE_GPU", value)
+		if !envBool("TEST_USE_GPU", false) {
+			t.Errorf("value %q should be true", value)
+		}
+	}
+	for _, value := range []string{"0", "false", "no", "off", "garbage"} {
+		t.Setenv("TEST_USE_GPU", value)
+		if envBool("TEST_USE_GPU", false) {
+			t.Errorf("value %q should be false", value)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Thread resolution
 // ---------------------------------------------------------------------------
 
